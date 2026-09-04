@@ -1,0 +1,116 @@
+# Tech Engineering Debt Radar
+
+Point it at a codebase and, optionally, a database. It analyzes both, builds a
+combined code + data dependency graph, and gives you heatmaps, an interactive
+graph, and AI guidance grounded in the real metrics.
+
+## Run it
+
+```bash
+cd backend
+pip install -r requirements.txt
+python3 app.py
+```
+
+Open **http://localhost:8000**, run an analysis, then click the gear icon in
+the header to set up an AI provider (Claude, Gemini, or Sarvam AI) under
+**Admin**. Nothing else needs configuring — no environment variables required.
+
+**Codebase tech**: Python (radon + bandit + ast) or .NET/C# (a bundled
+Roslyn-based analyzer under `backend/dotnet_tools/CodeMetrics`) — pick one or
+leave it on Auto-detect. The .NET path needs the **.NET SDK** installed and
+on `PATH`, and the target repo's packages already restored
+(`dotnet restore`), since it does real semantic analysis via MSBuildWorkspace
+rather than text/regex heuristics.
+
+**Database**: Postgres, MySQL/MariaDB, or SQL Server for a live connection
+(dialect is read from the connection string itself, e.g.
+`postgresql://...`, `mysql+pymysql://...`, `mssql+pyodbc://...` — SQL Server
+also needs an ODBC driver, e.g. "ODBC Driver 18 for SQL Server", installed on
+the host), or any of the three for a `.sql` schema file (pick the dialect
+explicitly there, since a file doesn't self-identify one).
+
+## What's in this version
+
+* **Code heatmap** — grouped by folder, colored by debt score.
+* **DB heatmap** — same idea for database tables. If you skipped the database
+step during setup, this tab explains that plainly instead of just vanishing.
+* **Combined dependency graph** — every file and table together: circles are
+files, squares are tables, edge color shows the relationship type (import,
+foreign key, or code-referencing-table). Drag, zoom, click to focus.
+* **DB-only dependency graph** — the same graph filtered to just tables and
+foreign keys, for a clean view of the data model on its own.
+* **"Color by" toggle** on both graphs — switch between overall debt, design
+concerns, or security concerns to see where each specific kind of risk
+concentrates.
+* **Ask tab** — structured, markdown-formatted answers (headings, tables,
+lists), grounded only in the actual computed metrics.
+* **On-demand recommendations** — click any node in a graph, then "Get
+recommendations" for a structured, specific remediation writeup.
+* **Confidence badges** — every AI answer ends with a self-reported
+High/Medium/Low confidence line, parsed out and shown as a badge rather than
+buried in the text. This is the model assessing how directly its own answer
+is supported by the data it was given — not a statistical probability.
+* **Feedback loop** — thumbs up/down are persisted to the app's own database.
+Recent down-voted answers are automatically included in future prompts as
+"avoid repeating this" examples. This is real and it runs every time you use
+the Ask tab — but it's in-context conditioning, not gradient-based
+reinforcement learning; no model weights are ever updated.
+* **Info icons** on every metric line item and every score-breakdown
+component, explaining exactly what it measures and how it's computed.
+* **Multi-provider AI** — Claude, Gemini, or Sarvam AI, switchable from
+Admin. Gemini and Sarvam are both called through their OpenAI-compatible
+endpoints.
+
+## Debt score, in full
+
+**Code**: 35% complexity + 20% churn (git history) + 25% security (bandit
+for Python, a Roslyn semantic-analysis pass for .NET — both weighted by
+severity and confidence) + 20% design (maintainability index, long
+functions, deep nesting, too many parameters, oversized files). Both
+languages feed the exact same scoring math
+(`backend/code_analyzers/scoring.py`), so files are directly comparable
+across a mixed codebase.
+
+**Database**: 30% performance (foreign keys with no covering index) + 15%
+size + 30% security (sensitive-looking column names, broad write grants —
+PUBLIC on Postgres/SQL Server, a wildcard-host grant as the closest MySQL
+equivalent) + 25% design (missing primary key, `\*\_id` columns with no real
+foreign key, table width).
+
+Every one of these sub-scores is visible in the app — click "How is this
+score calculated?" on any file or table's detail panel.
+
+## Known gaps, honestly
+
+* **The .NET path needs the repo to build.** Unlike the Python path (which
+  works on source alone), the Roslyn analyzer opens the real
+  `.sln`/`.csproj` via MSBuildWorkspace, so `dotnet restore` must succeed
+  against the target repo first. If no project can be loaded, the analysis
+  fails with a clear error rather than silently degrading.
+* **Only modern SDK-style .NET projects are supported** — `.NET Core`, `.NET
+  5` and later, anything with `<Project Sdk="Microsoft.NET.Sdk...">` at the
+  top of its `.csproj`. Classic, pre-2017-style full-.NET-Framework projects
+  (old ASP.NET MVC/Web Forms apps with `packages.config` and
+  `<TargetFrameworkVersion>`) need a full Visual Studio MSBuild install to
+  evaluate at all, which the cross-platform .NET SDK can't provide — the
+  analyzer detects this and fails with a clear message rather than a raw
+  MSBuild exception. If a machine also has Visual Studio/Build Tools
+  installed alongside the .NET SDK, the analyzer explicitly prefers the SDK's
+  own MSBuild to avoid a similar (harder to diagnose) version mismatch.
+* **MySQL's "public grant" signal is an approximation.** MySQL has no literal
+  PUBLIC role; a wildcard-host (`'user'@'%'`) grant is used as the closest
+  proxy for "broadly writable." Postgres and SQL Server both have a real
+  PUBLIC/public role, so those two are exact.
+* **No trend history** — each analysis run overwrites the last.
+* **The feedback loop is in-context, not gradient-based.** If you want actual
+prompt/weight optimization from accumulated feedback (e.g. a DSPy-style
+optimizer), that's a real additional build, not something to assume is
+already happening.
+* **Single-job, single-user** — one analysis runs at a time, in-memory job
+status.
+* **API keys are stored in this app's own local SQLite database** (via
+Admin), in plain text, on whatever machine runs the backend. Fine for a
+personal or team laptop; don't expose this server to the open internet
+as-is.
+

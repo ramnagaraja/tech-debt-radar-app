@@ -1,0 +1,12 @@
+fastapi
+uvicorn
+pydantic
+radon
+psycopg2-binary
+anthropic
+openai
+bandit
+sqlalchemy
+pymysql
+pyodbc
+sqlglot
