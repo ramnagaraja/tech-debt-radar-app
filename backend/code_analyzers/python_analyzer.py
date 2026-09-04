@@ -5,6 +5,7 @@ maintainability index). Callable as a function from app.py, or standalone
 via CLI.
 """
 import ast
+import hashlib
 import json
 import os
 import subprocess
@@ -61,6 +62,58 @@ def run_security_scan(repo_path):
     return dict(by_file)
 
 
+MIN_HASHED_FUNCTION_LINES = 3  # skip trivial one-line getters/props when hashing for duplication
+LONG_CHAIN_BRANCH_THRESHOLD = 5
+
+
+def _normalize_node_for_hash(node):
+    """Structural fingerprint of an AST subtree with identifier names and
+    literal values blanked out, so two functions that are copy-pasted with
+    renamed variables/different constants still hash identically — a real
+    (if approximate) reusability/duplication signal, not just 'same LOC'."""
+    if isinstance(node, ast.AST):
+        parts = [type(node).__name__]
+        for field_name, value in ast.iter_fields(node):
+            if isinstance(node, ast.Name) and field_name == "id":
+                parts.append("NAME")
+            elif isinstance(node, ast.arg) and field_name == "arg":
+                parts.append("ARG")
+            elif isinstance(node, ast.Constant) and field_name == "value":
+                parts.append("CONST")
+            elif isinstance(node, ast.Attribute) and field_name == "attr":
+                parts.append("ATTR")
+            elif isinstance(value, list):
+                parts.append("[" + ",".join(_normalize_node_for_hash(v) for v in value) + "]")
+            elif isinstance(value, ast.AST):
+                parts.append(_normalize_node_for_hash(value))
+        return "(" + ",".join(parts) + ")"
+    return ""
+
+
+def _function_hash(node):
+    start = node.lineno
+    end = getattr(node, "end_lineno", start)
+    if (end - start) < MIN_HASHED_FUNCTION_LINES:
+        return None
+    shape = _normalize_node_for_hash(node)
+    return hashlib.sha1(shape.encode("utf-8")).hexdigest()[:16]
+
+
+def _if_chain_branch_count(if_node):
+    """Counts if + elif + (1 for a trailing plain else) for the chain
+    starting at if_node — an elif is represented in the AST as a single-item
+    orelse containing another If, so we walk that chain rather than treating
+    each elif as its own independent if."""
+    count = 1
+    node = if_node
+    while len(node.orelse) == 1 and isinstance(node.orelse[0], ast.If):
+        count += 1
+        node = node.orelse[0]
+    if node.orelse:
+        count += 1
+    return count
+
+
 def compute_design_smells(full_path, loc):
     """Real ast-derived design signals — not just an inverted maintainability
     index. Each is independently computable and explainable:
@@ -68,17 +121,30 @@ def compute_design_smells(full_path, loc):
       - deep nesting (>4 levels of if/for/while/try): hard-to-follow control flow
       - too many parameters (>5): a signal the function's doing too much / needs a parameter object
       - god file (>500 lines): the file itself has grown too large to reason about
+      - duplicate/near-duplicate function bodies (reusability): a structural
+        hash per function, compared across the whole analysis run in
+        scoring.compute_duplicate_counts (this function only emits the hash)
+      - high public surface (SRP/god-class proxy): count of non-underscore
+        top-level functions/methods
+      - long if/elif or match/case chains (>5 branches): an OCP proxy —
+        'this probably wants to be polymorphism/a strategy map instead'
     """
+    empty = {
+        "long_function_count": 0, "max_nesting_depth": 0, "many_params_count": 0, "god_file": False,
+        "function_hashes": [], "public_function_count": 0, "long_conditional_chain_count": 0,
+    }
     try:
         with open(full_path, "r", encoding="utf-8", errors="ignore") as fh:
             src = fh.read()
         tree = ast.parse(src)
     except Exception:
-        return {"long_function_count": 0, "max_nesting_depth": 0, "many_params_count": 0, "god_file": False}
+        return empty
 
     long_function_count = 0
     many_params_count = 0
     max_nesting_depth = 0
+    public_function_count = 0
+    function_hashes = []
     NESTING_NODES = (ast.If, ast.For, ast.While, ast.Try, ast.With, ast.AsyncFor, ast.AsyncWith)
 
     def walk_depth(node, depth):
@@ -96,13 +162,39 @@ def compute_design_smells(full_path, loc):
             params = [p for p in (node.args.args + node.args.kwonlyargs) if p.arg not in ("self", "cls")]
             if len(params) > 5:
                 many_params_count += 1
+            if not node.name.startswith("_"):
+                public_function_count += 1
+            h = _function_hash(node)
+            if h:
+                function_hashes.append(h)
             walk_depth(node, 0)
+
+    # If/elif chains: skip elif-continuations so a 6-branch chain counts once,
+    # not once per elif. match/case (Python's actual switch) counts directly.
+    elif_continuations = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.If):
+            n = node
+            while len(n.orelse) == 1 and isinstance(n.orelse[0], ast.If):
+                elif_continuations.add(id(n.orelse[0]))
+                n = n.orelse[0]
+
+    long_conditional_chain_count = 0
+    for node in ast.walk(tree):
+        if isinstance(node, ast.If) and id(node) not in elif_continuations:
+            if _if_chain_branch_count(node) > LONG_CHAIN_BRANCH_THRESHOLD:
+                long_conditional_chain_count += 1
+        elif isinstance(node, getattr(ast, "Match", ())) and len(node.cases) > LONG_CHAIN_BRANCH_THRESHOLD:
+            long_conditional_chain_count += 1
 
     return {
         "long_function_count": long_function_count,
         "max_nesting_depth": max_nesting_depth,
         "many_params_count": many_params_count,
         "god_file": loc > 500,
+        "function_hashes": function_hashes,
+        "public_function_count": public_function_count,
+        "long_conditional_chain_count": long_conditional_chain_count,
     }
 
 
@@ -185,8 +277,14 @@ def build_import_graph(repo_path, rel_files):
     return unique_edges
 
 
-def analyze_codebase(repo_path):
-    """Returns {'files': [...], 'edges': [...], 'raw_source_text': {rel: src}}"""
+def collect_metrics(repo_path):
+    """Returns {'metrics': {rel: {...}}, 'edges': [...], 'source_text': {...}}
+    — everything analyze_codebase() computes, but *before* scoring.
+    compute_debt_scores() is applied. Kept separate so multi_source.py can
+    merge several repos' metrics and score them together in one pass (this
+    is what makes cross-repo duplicate-code detection and cross-repo-relative
+    normalization possible — scoring one repo at a time would silently miss
+    both)."""
     files = find_py_files(repo_path)
     rel_files = [rel for _, rel in files]
     churn = scoring.compute_churn(repo_path, rel_files)
@@ -211,8 +309,16 @@ def analyze_codebase(repo_path):
             source_text[rel] = ""
 
     edges = build_import_graph(repo_path, rel_files)
-    rows = scoring.compute_debt_scores(metrics, edges)
-    return {"files": rows, "edges": edges, "_source_text": source_text}
+    return {"metrics": metrics, "edges": edges, "source_text": source_text}
+
+
+def analyze_codebase(repo_path):
+    """Returns {'files': [...], 'edges': [...], '_source_text': {rel: src}}
+    — single-repo entry point (standalone CLI use, and the shape
+    code_analyzers/__init__.py's analyze_codebase() dispatches to)."""
+    collected = collect_metrics(repo_path)
+    rows = scoring.compute_debt_scores(collected["metrics"], collected["edges"])
+    return {"files": rows, "edges": collected["edges"], "_source_text": collected["source_text"]}
 
 
 if __name__ == "__main__":

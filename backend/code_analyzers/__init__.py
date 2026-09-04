@@ -36,11 +36,25 @@ def get_analyzer(lang):
     raise ValueError(f"Unsupported code_lang: {lang!r}. Supported: {SUPPORTED_LANGUAGES}")
 
 
-def analyze_codebase(repo_path, lang="auto"):
+def _resolve(repo_path, lang):
     resolved = detect_language(repo_path) if lang == "auto" else lang
     if resolved == "unknown":
         resolved = "python"  # safest default: an empty result is more useful than a hard error
-    analyzer = get_analyzer(resolved)
-    result = analyzer.analyze_codebase(repo_path)
+    return resolved
+
+
+def analyze_codebase(repo_path, lang="auto"):
+    resolved = _resolve(repo_path, lang)
+    result = get_analyzer(resolved).analyze_codebase(repo_path)
+    result["_code_lang"] = resolved
+    return result
+
+
+def collect_metrics(repo_path, lang="auto"):
+    """Unscored per-file metrics (see python_analyzer.collect_metrics) —
+    used by multi_source.py to merge several repos before scoring them
+    together in one pass."""
+    resolved = _resolve(repo_path, lang)
+    result = get_analyzer(resolved).collect_metrics(repo_path)
     result["_code_lang"] = resolved
     return result

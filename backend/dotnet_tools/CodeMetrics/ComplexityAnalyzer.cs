@@ -1,3 +1,5 @@
+using System.Security.Cryptography;
+using System.Text;
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp;
 using Microsoft.CodeAnalysis.CSharp.Syntax;
@@ -7,9 +9,13 @@ namespace CodeMetrics;
 /// C# equivalent of python_analyzer.py's compute_complexity + compute_design_smells,
 /// using real Roslyn syntax instead of Python's ast/radon so both languages produce
 /// comparable numbers (same maintainability-index formula, same design-smell
-/// thresholds: long function >50 lines, deep nesting >4, many params >5, god file >500 loc).
+/// thresholds: long function >50 lines, deep nesting >4, many params >5, god file >500 loc,
+/// duplicate-body hashing, high public surface, long if/switch chains >5 branches).
 public static class ComplexityAnalyzer
 {
+    private const int MinHashedFunctionLines = 3;
+    private const int LongChainBranchThreshold = 5;
+
     private static readonly Type[] NestingNodeTypes =
     {
         typeof(IfStatementSyntax), typeof(ForStatementSyntax), typeof(ForEachStatementSyntax),
@@ -35,7 +41,8 @@ public static class ComplexityAnalyzer
             .ToList();
 
         var complexities = new List<int>();
-        int longFunctions = 0, manyParams = 0, maxNesting = 0;
+        int longFunctions = 0, manyParams = 0, maxNesting = 0, publicFunctions = 0;
+        var functionHashes = new List<string>();
 
         foreach (var fn in functionNodes)
         {
@@ -48,6 +55,10 @@ public static class ComplexityAnalyzer
             if (lines > 50) longFunctions++;
 
             if (GetParameterCount(fn) > 5) manyParams++;
+            if (IsPublic(fn)) publicFunctions++;
+
+            if (lines >= MinHashedFunctionLines)
+                functionHashes.Add(HashBody(body));
 
             maxNesting = Math.Max(maxNesting, MaxNestingDepth(fn, 0));
         }
@@ -69,7 +80,81 @@ public static class ComplexityAnalyzer
             MaxNestingDepth = maxNesting,
             ManyParamsCount = manyParams,
             GodFile = loc > 500,
+            FunctionHashes = functionHashes,
+            PublicFunctionCount = publicFunctions,
+            LongConditionalChainCount = CountLongConditionalChains(root),
         };
+    }
+
+    private static bool IsPublic(SyntaxNode fn) => fn switch
+    {
+        MethodDeclarationSyntax m => m.Modifiers.Any(SyntaxKind.PublicKeyword),
+        ConstructorDeclarationSyntax c => c.Modifiers.Any(SyntaxKind.PublicKeyword),
+        _ => false, // local functions have no accessibility modifier — never "public surface"
+    };
+
+    /// Token-stream fingerprint with identifiers/literals blanked out, so a
+    /// function copy-pasted with renamed variables/different constants still
+    /// hashes identically — the C# counterpart to python_analyzer.py's
+    /// AST-structure-based _normalize_node_for_hash (different technique,
+    /// same "identifier-blind shape" goal; the two languages' hashes are
+    /// never expected to collide with each other, only within a language).
+    private static string HashBody(SyntaxNode body)
+    {
+        var sb = new StringBuilder();
+        foreach (var token in body.DescendantTokens())
+        {
+            var kind = token.Kind();
+            if (kind == SyntaxKind.IdentifierToken) sb.Append("ID;");
+            else if (kind is SyntaxKind.NumericLiteralToken or SyntaxKind.StringLiteralToken or SyntaxKind.CharacterLiteralToken)
+                sb.Append("LIT;");
+            else sb.Append((int)kind).Append(';');
+        }
+        var hashBytes = SHA1.HashData(Encoding.UTF8.GetBytes(sb.ToString()));
+        return Convert.ToHexString(hashBytes)[..16];
+    }
+
+    /// If/elif chains and switch statements with more than
+    /// LongChainBranchThreshold branches — an OCP proxy ("this probably
+    /// wants to be polymorphism/a strategy map instead"). Walks the whole
+    /// file (not scoped to function bodies), matching python_analyzer.py.
+    private static int CountLongConditionalChains(SyntaxNode root)
+    {
+        var elseIfContinuations = new HashSet<IfStatementSyntax>();
+        foreach (var ifNode in root.DescendantNodes().OfType<IfStatementSyntax>())
+        {
+            var current = ifNode;
+            while (current.Else?.Statement is IfStatementSyntax nextIf)
+            {
+                elseIfContinuations.Add(nextIf);
+                current = nextIf;
+            }
+        }
+
+        int count = 0;
+        foreach (var ifNode in root.DescendantNodes().OfType<IfStatementSyntax>())
+        {
+            if (elseIfContinuations.Contains(ifNode)) continue;
+            if (IfChainBranchCount(ifNode) > LongChainBranchThreshold) count++;
+        }
+        foreach (var switchNode in root.DescendantNodes().OfType<SwitchStatementSyntax>())
+        {
+            if (switchNode.Sections.Count > LongChainBranchThreshold) count++;
+        }
+        return count;
+    }
+
+    private static int IfChainBranchCount(IfStatementSyntax ifNode)
+    {
+        int count = 1;
+        var current = ifNode;
+        while (current.Else?.Statement is IfStatementSyntax nextIf)
+        {
+            count++;
+            current = nextIf;
+        }
+        if (current.Else != null) count++; // trailing plain else
+        return count;
     }
 
     private static SyntaxNode? GetBody(SyntaxNode fn) => fn switch

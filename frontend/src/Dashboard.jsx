@@ -109,6 +109,9 @@ const CODE_METRIC_INFO = {
   long_function_count: "Functions longer than 50 lines in this file, detected by walking the file's syntax tree. A classic 'this function does too much' smell — one of several signals feeding the design score.",
   max_nesting_depth: "The deepest level of nested if/for/while/try blocks found in any function in this file. Deep nesting (past ~4 levels) makes code hard to follow and easy to break; also feeds the design score.",
   many_params_count: "Functions with more than 5 parameters in this file — often a sign a function is doing too much and would benefit from being split or taking a parameter object instead.",
+  duplicate_function_count: "Functions in this file whose structure matches a function elsewhere in this analysis — identifiers and literals are ignored, so a copy-paste with renamed variables still counts. Compared across every repo in this run, not just this file — a reusability signal: the same logic living in two places instead of one.",
+  public_function_count: "Public functions/methods declared in this file (module-level defs in Python; public methods in .NET). A high count on one file is a rough single-responsibility proxy — it may be doing several unrelated jobs that could be split into smaller, more focused units.",
+  long_conditional_chain_count: "if/elif (or switch/match) chains in this file with more than 5 branches. A classic open/closed-principle smell — this dispatch logic often reads more clearly, and is easier to extend, as polymorphism or a lookup table instead.",
   fan_out: "Number of other files this file imports from (or references, for .NET). High fan-out means this file depends on a lot of moving parts — changes elsewhere in the codebase are more likely to affect it.",
   fan_in: "Number of other files that import/reference this one — its 'blast radius'. High fan-in means changes to this file are more likely to ripple outward and break something else; a good signal for prioritizing what to make safe to change first.",
   security_issue_count: "Total findings from real static analysis run against this file (bandit for Python; a Roslyn semantic-analysis pass for .NET — SQL injection patterns, weak crypto, hardcoded secrets, insecure deserialization, command injection). Each finding has a severity (LOW/MEDIUM/HIGH) and a confidence level, both of which weight how much they move the debt score.",
@@ -129,7 +132,7 @@ const WEIGHT_INFO = {
   complexity: "How tangled the code's control flow is (cyclomatic complexity) — more independent branches means more paths to test and more ways to introduce a bug.",
   churn: "How often this file has changed in the last 2 years (git history). Frequent changes compound risk from the other factors — a hotspot is complex AND frequently touched.",
   security: "Real findings from static analysis: bandit or a Roslyn semantic pass for code (SQL injection patterns, hardcoded secrets, unsafe deserialization, etc.) or schema checks for data (exposed sensitive columns, over-permissive grants).",
-  design: "A blend of maintainability index, long functions, deep nesting, too many parameters, and oversized files (code) — or missing primary key, unenforced relationships, and table width (data).",
+  design: "A blend of maintainability index, long functions, deep nesting, too many parameters, oversized files, duplicate/near-duplicate code, high public surface (SRP proxy), and long if/switch chains (OCP proxy) for code — or missing primary key, unenforced relationships, and table width for data.",
   performance: "Checkable performance risk — currently just foreign keys with no covering index, which slows joins and cascading deletes as a table grows.",
   size: "Table size by row count — bigger tables carry more operational weight per schema or query change.",
 };
@@ -378,12 +381,13 @@ function nodeRadius(d) {
   return Math.max(7, Math.min(22, 7 + Math.sqrt(degree) * 3.2));
 }
 
-function buildNodeRecommendationPrompt(data, node, outs, ins) {
+function buildNodeRecommendationPrompt(data, node, outs, ins, sourceCode) {
   const isTable = node.kind === "table";
   const lines = [`Item: ${node.id} (${isTable ? "database table" : "code file"})`, `Debt score: ${node.debt_score}`];
   if (!isTable) {
     lines.push(`Avg complexity: ${node.avg_complexity} | Max complexity: ${node.max_complexity} | Maintainability index: ${node.maintainability_index}`);
     lines.push(`Churn (2yr commits): ${node.churn} | Long functions: ${node.long_function_count} | Max nesting depth: ${node.max_nesting_depth} | God file: ${node.god_file}`);
+    lines.push(`Duplicate/near-duplicate functions (matched elsewhere in this analysis): ${node.duplicate_function_count ?? 0} | Public functions/methods: ${node.public_function_count ?? 0} | Long if/switch chains (>5 branches): ${node.long_conditional_chain_count ?? 0}`);
     if (node.security_issue_count > 0) {
       lines.push(`Security findings (${node.security_issue_count}, ${node.security_high_count} high):`);
       (node.security_issues || []).forEach((iss) => lines.push(`  - [${iss.severity}] ${iss.test_id}: ${iss.text} (line ${iss.line})`));
@@ -397,6 +401,11 @@ function buildNodeRecommendationPrompt(data, node, outs, ins) {
   }
   lines.push(`Depends on: ${outs.map((n) => n.id).join(", ") || "none"}`);
   lines.push(`Depended on by: ${ins.map((n) => n.id).join(", ") || "none"}`);
+  const extCtx = buildExternalContextSection(data);
+  if (extCtx.trim()) lines.push(extCtx.trim());
+  if (sourceCode) {
+    lines.push(`\nFull source of ${node.id}${sourceCode.truncated ? " (truncated)" : ""}:\n\`\`\`\n${sourceCode.source}\n\`\`\``);
+  }
   return lines.join("\n");
 }
 
@@ -439,12 +448,27 @@ function FullGraphTab({ nodesById, edges, data, focal, setFocal, filterKind, emp
   async function getRecommendations(node, outs, ins) {
     setRecommendation({ forId: node.id, loading: true, text: "", error: false });
     try {
-      const prompt = buildNodeRecommendationPrompt(data, node, outs, ins);
+      let sourceCode = null;
+      if (node.kind !== "table") {
+        try {
+          const srcRes = await fetch(`/api/file-source?id=${encodeURIComponent(node.id)}`);
+          const srcJson = await srcRes.json();
+          if (srcJson.ok) sourceCode = srcJson;
+        } catch {
+          // no source available (e.g. re-analyzed elsewhere since) — recommendations still work, just metrics-only
+        }
+      }
+
+      const prompt = buildNodeRecommendationPrompt(data, node, outs, ins, sourceCode);
+      const systemPrompt = sourceCode
+        ? "You are a staff engineer giving remediation guidance for one specific code file in an engineering-debt dashboard, and you have been given its real source code below the metrics. Use the metrics as signal for WHAT to focus on, and the real source for HOW to fix it. Structure your answer in markdown with these sections: '## What's driving the debt score' (2-3 sentences tying the score components to what you see in the actual code), '## SOLID / design-pattern / reusability critique' (call out specific violations you can see in the real code — SRP, OCP, duplicated logic, tight coupling — not generic principles), '## Recommended fixes' (a prioritized numbered list, most impactful first, each with a one-line why and, where it clarifies the fix, a short before/after fenced code block quoting the actual lines), and '## Quick win' (the single smallest change that would help soonest). End with a line of the exact form '**Confidence: High|Medium|Low** — <one short reason>'. Ground every suggestion in the actual code shown — never invent code that isn't there."
+        : "You are a staff engineer giving remediation guidance for one specific file or database table in an engineering-debt dashboard. Use ONLY the data given — never invent metrics. Structure your answer in markdown with these sections: '## What's driving the debt score' (2-3 sentences tying the score components to what you see), '## Recommended fixes' (a prioritized numbered list, most impactful first, each with a one-line why), and '## Quick win' (the single smallest change that would help soonest). End with a line of the exact form '**Confidence: High|Medium|Low** — <one short reason>' reflecting how directly the data supports these recommendations. Be concrete and specific to the actual metrics/issues listed, not generic advice.";
+
       const res = await fetch(CHAT_API_URL, {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          max_tokens: 900,
-          system: "You are a staff engineer giving remediation guidance for one specific file or database table in an engineering-debt dashboard. Use ONLY the data given — never invent metrics. Structure your answer in markdown with these sections: '## What's driving the debt score' (2-3 sentences tying the score components to what you see), '## Recommended fixes' (a prioritized numbered list, most impactful first, each with a one-line why), and '## Quick win' (the single smallest change that would help soonest). End with a line of the exact form '**Confidence: High|Medium|Low** — <one short reason>' reflecting how directly the data supports these recommendations. Be concrete and specific to the actual metrics/issues listed, not generic advice.",
+          max_tokens: sourceCode ? 1500 : 900,
+          system: systemPrompt,
           messages: [{ role: "user", content: prompt }],
         }),
       });
@@ -684,20 +708,46 @@ const SAMPLE_QUESTIONS = [
   "Where should the team focus refactoring effort first?",
 ];
 
+function codebaseTechLine(data) {
+  if (data.repos?.length > 1) {
+    return data.repos.map((r) => `${r.name} (${r.code_lang === "dotnet" ? ".NET" : "Python"})`).join(", ");
+  }
+  return data.code_lang === "dotnet" ? ".NET (C#, analyzed via Roslyn)" : "Python";
+}
+
+function databaseLine(data) {
+  if (data.databases?.length > 1) {
+    return data.databases.map((d) => `${d.name} (${DB_DIALECT_LABELS[d.dialect] || d.dialect})`).join(", ");
+  }
+  return data.db_dialect ? DB_DIALECT_LABELS[data.db_dialect] || data.db_dialect : null;
+}
+
+function buildExternalContextSection(data) {
+  const entries = data.external_context || [];
+  if (!entries.length) return "";
+  const rendered = entries.map((c) => (
+    c.ok
+      ? `### ${c.kind === "jira" ? "Jira" : "Confluence"}: ${c.title || c.url}\n${c.text}`
+      : `(${c.kind === "jira" ? "Jira" : "Confluence"} fetch for ${c.url} failed: ${c.error})`
+  ));
+  return `\nProject context from Jira/Confluence:\n${rendered.join("\n\n")}\n`;
+}
+
 function buildContext(data) {
   const topFiles = [...data.files].sort((a, b) => b.debt_score - a.debt_score).slice(0, 12);
   const topTables = [...(data.tables || [])].sort((a, b) => b.debt_score - a.debt_score).slice(0, 8);
+  const dbLine = databaseLine(data);
   return `Repository: ${data.repo}
-Codebase tech: ${data.code_lang === "dotnet" ? ".NET (C#, analyzed via Roslyn)" : "Python"}${data.db_dialect ? ` | Database: ${DB_DIALECT_LABELS[data.db_dialect] || data.db_dialect}` : ""}
+Codebase tech: ${codebaseTechLine(data)}${dbLine ? ` | Database: ${dbLine}` : ""}
 Metrics last computed: ${data.generated_at}
 Files: ${data.summary.total_files} | Tables: ${data.summary.total_tables} | Edges: ${data.summary.total_edges} | Avg code debt: ${data.summary.avg_code_debt} | Avg DB debt: ${data.summary.avg_db_debt}
 
-Code debt_score = 35% complexity + 20% churn + 25% security (static analysis findings) + 20% design (maintainability index, long functions, deep nesting, too many params, oversized files).
+Code debt_score = 35% complexity + 20% churn + 25% security (static analysis findings) + 20% design (maintainability index, long functions, deep nesting, too many params, oversized files, duplicate/near-duplicate code, high public surface, long if/switch chains).
 DB debt_score = 30% performance (unindexed FKs) + 15% size + 30% security (sensitive columns, broad write grants) + 25% design (missing PK, unenforced *_id relationships, table width).
-
+${buildExternalContextSection(data)}
 Top files by debt score:
-${topFiles.map((f) => `- ${f.file} | debt=${f.debt_score} (complexity=${f.score_breakdown?.complexity}, churn=${f.score_breakdown?.churn}, security=${f.score_breakdown?.security}, design=${f.score_breakdown?.design}) | avg_complexity=${f.avg_complexity} | churn=${f.churn} | security_issues=${f.security_issue_count}(${f.security_high_count} high) | fan_in=${f.fan_in}`).join("\n")}
-${topTables.length ? `\nTop DB tables by debt score:\n${topTables.map((t) => `- ${t.file} | debt=${t.debt_score} (performance=${t.score_breakdown?.performance}, security=${t.score_breakdown?.security}, design=${t.score_breakdown?.design}) | rows=${t.row_estimate ?? "unknown"} | missing_indexed_fks=${t.missing_indexed_fks ?? "unknown"} | high_risk_columns=${(t.high_risk_columns||[]).join(",") || "none"} | missing_pk=${t.missing_primary_key} | fk_in=${t.fk_in}`).join("\n")}` : ""}
+${topFiles.map((f) => `- ${f.file}${f.repo ? ` [repo: ${f.repo}]` : ""} | debt=${f.debt_score} (complexity=${f.score_breakdown?.complexity}, churn=${f.score_breakdown?.churn}, security=${f.score_breakdown?.security}, design=${f.score_breakdown?.design}) | avg_complexity=${f.avg_complexity} | churn=${f.churn} | security_issues=${f.security_issue_count}(${f.security_high_count} high) | duplicate_functions=${f.duplicate_function_count ?? 0} | long_conditional_chains=${f.long_conditional_chain_count ?? 0} | fan_in=${f.fan_in}`).join("\n")}
+${topTables.length ? `\nTop DB tables by debt score:\n${topTables.map((t) => `- ${t.file}${t.db ? ` [db: ${t.db}]` : ""} | debt=${t.debt_score} (performance=${t.score_breakdown?.performance}, security=${t.score_breakdown?.security}, design=${t.score_breakdown?.design}) | rows=${t.row_estimate ?? "unknown"} | missing_indexed_fks=${t.missing_indexed_fks ?? "unknown"} | high_risk_columns=${(t.high_risk_columns||[]).join(",") || "none"} | missing_pk=${t.missing_primary_key} | fk_in=${t.fk_in}`).join("\n")}` : ""}
 `;
 }
 
@@ -929,8 +979,12 @@ export default function Dashboard({ data, onReanalyze }) {
             <div style={{ fontSize: 15, fontWeight: 700 }}>Tech Engineering Debt Radar</div>
             <div style={{ fontSize: 11.5, color: "#93A7BF", display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
               <span>repo: {data.repo}{hasDb ? " · db connected" : " · no database analyzed"}</span>
-              {data.code_lang && <TechBadge label={data.code_lang === "dotnet" ? ".NET" : "Python"} />}
-              {data.db_dialect && <TechBadge label={DB_DIALECT_LABELS[data.db_dialect] || data.db_dialect} />}
+              {(data.repos?.length > 1
+                ? data.repos.map((r) => <TechBadge key={r.slug} label={`${r.name}: ${r.code_lang === "dotnet" ? ".NET" : "Python"}`} />)
+                : data.code_lang && <TechBadge label={data.code_lang === "dotnet" ? ".NET" : "Python"} />)}
+              {(data.databases?.length > 1
+                ? data.databases.map((d) => <TechBadge key={d.slug} label={`${d.name}: ${DB_DIALECT_LABELS[d.dialect] || d.dialect}`} />)
+                : data.db_dialect && <TechBadge label={DB_DIALECT_LABELS[data.db_dialect] || data.db_dialect} />)}
             </div>
           </div>
         </div>
@@ -967,7 +1021,7 @@ export default function Dashboard({ data, onReanalyze }) {
               items={data.files.map((f) => ({ ...f, id: f.file }))} sizeKey="loc" groupByDir
               legendNote="Grouped by folder · tile size = lines of code · color = debt score. Click a tile for detail."
               selected={selectedFile} setSelected={setSelectedFile} goToDeps={goToDeps}
-              detailFields={[["Lines of code", "loc"], ["Avg. complexity", "avg_complexity"], ["Max. complexity", "max_complexity"], ["Maintainability index", "maintainability_index", "0–100, lower is worse"], ["Commits (2yr churn)", "churn"], ["Long functions (>50 lines)", "long_function_count"], ["Max nesting depth", "max_nesting_depth"], ["Many-parameter functions", "many_params_count"], ["Security findings", "security_issue_count"], ["Depends on", "fan_out"], ["Depended on by", "fan_in"]]}
+              detailFields={[["Lines of code", "loc"], ["Avg. complexity", "avg_complexity"], ["Max. complexity", "max_complexity"], ["Maintainability index", "maintainability_index", "0–100, lower is worse"], ["Commits (2yr churn)", "churn"], ["Long functions (>50 lines)", "long_function_count"], ["Max nesting depth", "max_nesting_depth"], ["Many-parameter functions", "many_params_count"], ["Duplicate functions", "duplicate_function_count"], ["Public functions/methods", "public_function_count"], ["Long if/switch chains (>5 branches)", "long_conditional_chain_count"], ["Security findings", "security_issue_count"], ["Depends on", "fan_out"], ["Depended on by", "fan_in"]]}
             />
           )}
           {tab === "db" && (

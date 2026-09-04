@@ -11,6 +11,7 @@ const PROVIDER_NOTES = {
 export default function AdminPanel({ onClose }) {
   const [settings, setSettings] = useState(null);
   const [form, setForm] = useState({}); // { [provider]: { model, api_key } }
+  const [atlassianForm, setAtlassianForm] = useState({ email: "", api_token: "" });
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
   const [stats, setStats] = useState(null);
@@ -21,6 +22,7 @@ export default function AdminPanel({ onClose }) {
       const f = {};
       for (const p of PROVIDER_ORDER) f[p] = { model: s.providers[p]?.model || "", api_key: "" };
       setForm(f);
+      setAtlassianForm({ email: s.atlassian?.email || "", api_token: "" });
     });
     fetch("/api/feedback/stats").then((r) => r.json()).then(setStats).catch(() => {});
   }, []);
@@ -28,7 +30,11 @@ export default function AdminPanel({ onClose }) {
   async function save() {
     setSaving(true);
     setSaved(false);
-    const body = { active_provider: settings.active_provider };
+    const body = {
+      active_provider: settings.active_provider,
+      atlassian_email: atlassianForm.email,
+      atlassian_api_token: atlassianForm.api_token || undefined,
+    };
     for (const p of PROVIDER_ORDER) {
       body[`${p}_model`] = form[p]?.model || undefined;
       body[`${p}_api_key`] = form[p]?.api_key || undefined;
@@ -40,6 +46,7 @@ export default function AdminPanel({ onClose }) {
       const f = {};
       for (const p of PROVIDER_ORDER) f[p] = { model: fresh.providers[p]?.model || "", api_key: "" };
       setForm(f);
+      setAtlassianForm({ email: fresh.atlassian?.email || "", api_token: "" });
       setSaved(true);
       setTimeout(() => setSaved(false), 2500);
     }
@@ -53,13 +60,43 @@ export default function AdminPanel({ onClose }) {
       <div style={{ width: 560, maxHeight: "88vh", overflowY: "auto", background: "#FFFFFF", borderRadius: 14, padding: 26, boxShadow: "0 24px 60px rgba(15,37,64,0.3)" }}>
         <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 6 }}>
           <div style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 16, fontWeight: 700, color: "#0F2540" }}>
-            <Settings size={17} /> Admin — AI provider settings
+            <Settings size={17} /> Admin settings
           </div>
           <button onClick={onClose} style={{ background: "none", border: "none", cursor: "pointer", color: "#93A7BF" }}><X size={18} /></button>
         </div>
         <p style={{ fontSize: 12.5, color: "#5B7290", marginTop: 0, marginBottom: 20 }}>
-          Choose which model powers the Ask tab and dependency recommendations. Keys are stored locally in this app's own database, never sent anywhere except the provider you pick.
+          Choose which model powers the Ask tab and dependency recommendations, and the Atlassian credentials used to pull Jira/Confluence context into that guidance. Keys are stored locally in this app's own database, never sent anywhere except the provider (or Atlassian) they're for.
         </p>
+
+        <div style={{ border: "1px solid #E1EBF5", borderRadius: 10, padding: 14, marginBottom: 16 }}>
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 6 }}>
+            <div style={{ fontSize: 13.5, fontWeight: 700, color: "#0F2540" }}>External context — Jira &amp; Confluence</div>
+            {settings.atlassian?.has_token ? (
+              <span style={{ display: "flex", alignItems: "center", gap: 4, fontSize: 11, color: "#0F7B4E", background: "#E7F9F1", padding: "2px 8px", borderRadius: 99 }}>
+                <Check size={11} /> token set{settings.atlassian.token_preview ? ` (${settings.atlassian.token_preview})` : ""}
+              </span>
+            ) : (
+              <span style={{ fontSize: 11, color: "#B45309", background: "#FEF3E2", padding: "2px 8px", borderRadius: 99 }}>no token yet</span>
+            )}
+          </div>
+          <p style={{ fontSize: 11, color: "#7B8FA8", margin: "0 0 8px" }}>
+            One Atlassian Cloud API token (from id.atlassian.com) authenticates both Jira and Confluence — used when you add Jira/Confluence links in Setup.
+          </p>
+          <div style={{ display: "flex", gap: 8 }}>
+            <input
+              value={atlassianForm.email} onChange={(e) => setAtlassianForm((f) => ({ ...f, email: e.target.value }))}
+              placeholder="you@yourcompany.com" style={{ flex: 1, padding: "7px 10px", borderRadius: 7, border: "1px solid #DCEAF6", fontSize: 12 }}
+            />
+            <div style={{ flex: 1.4, position: "relative" }}>
+              <Key size={12} style={{ position: "absolute", left: 9, top: 9, color: "#B7CDE3" }} />
+              <input
+                type="password" value={atlassianForm.api_token} onChange={(e) => setAtlassianForm((f) => ({ ...f, api_token: e.target.value }))}
+                placeholder={settings.atlassian?.has_token ? "leave blank to keep existing token" : "paste API token"}
+                style={{ width: "100%", boxSizing: "border-box", padding: "7px 10px 7px 26px", borderRadius: 7, border: "1px solid #DCEAF6", fontSize: 12 }}
+              />
+            </div>
+          </div>
+        </div>
 
         {PROVIDER_ORDER.map((p) => {
           const meta = settings.providers[p];

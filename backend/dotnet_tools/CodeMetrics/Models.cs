@@ -30,6 +30,9 @@ public class FileMetrics
     [JsonPropertyName("max_nesting_depth")] public int MaxNestingDepth { get; set; }
     [JsonPropertyName("many_params_count")] public int ManyParamsCount { get; set; }
     [JsonPropertyName("god_file")] public bool GodFile { get; set; }
+    [JsonPropertyName("function_hashes")] public List<string> FunctionHashes { get; set; } = new();
+    [JsonPropertyName("public_function_count")] public int PublicFunctionCount { get; set; }
+    [JsonPropertyName("long_conditional_chain_count")] public int LongConditionalChainCount { get; set; }
 }
 
 public class EdgeDto

@@ -15,7 +15,6 @@ import subprocess
 import tempfile
 import threading
 import time
-import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -32,7 +31,9 @@ from pydantic import BaseModel
 
 import code_analyzers
 import db_analyzers
+import external_context
 import llm_providers
+import multi_source
 
 BASE_DIR = Path(__file__).parent
 DATA_DIR = BASE_DIR / "app_data"
@@ -47,6 +48,7 @@ app = FastAPI()
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 JOB = {"status": "idle", "step": "", "error": None}  # single-job app — one analysis at a time
+FILE_PATHS = {}  # {namespaced_file_id: absolute_path}, rebuilt on every analysis — backs /api/file-source
 
 
 def init_app_db():
@@ -77,27 +79,41 @@ def set_setting(key, value):
     conn.close()
 
 
+class RepoEntry(BaseModel):
+    name: str | None = None
+    source: str             # "local" | "git_url" — "local" also covers UNC/network paths, just a filesystem path
+    value: str               # a filesystem path (local or \\server\share\...), or a git URL
+    code_lang: str = "auto"  # "auto" | "python" | "dotnet"
+
+
+class DbEntry(BaseModel):
+    name: str | None = None
+    source: str              # "connection_string" | "sql_file" — sql_file path may be local or UNC
+    value: str
+    dialect: str = "auto"    # "auto" | "postgres" | "mysql" | "mssql" — only consulted for sql_file
+
+
+class ExternalContextEntry(BaseModel):
+    kind: str                # "jira" | "confluence"
+    url: str
+
+
 class AnalyzeRequest(BaseModel):
-    repo_source: str        # "local" | "git_url"
-    repo_value: str         # a filesystem path, or a git URL
-    db_source: str | None = None   # "connection_string" | "sql_file" | None
-    db_value: str | None = None
-    repo_name: str | None = None
-    code_lang: str = "auto"        # "auto" | "python" | "dotnet"
-    db_dialect: str = "auto"       # "auto" | "postgres" | "mysql" | "mssql" — only used for db_source == "sql_file"
+    repos: list[RepoEntry]
+    databases: list[DbEntry] = []
+    external_context: list[ExternalContextEntry] = []
 
 
-def resolve_repo_path(req: AnalyzeRequest) -> str:
-    if req.repo_source == "local":
-        if not os.path.isdir(req.repo_value):
-            raise ValueError(f"Local path not found: {req.repo_value}")
-        return req.repo_value
+def resolve_repo_path(source: str, value: str, slug: str) -> str:
+    if source == "local":
+        if not os.path.isdir(value):
+            raise ValueError(f"Local path not found: {value}")
+        return value
     # git_url
-    name = req.repo_name or f"repo-{uuid.uuid4().hex[:8]}"
-    dest = str(CLONE_DIR / name)
+    dest = str(CLONE_DIR / slug)
     if os.path.isdir(dest):
         shutil.rmtree(dest)
-    subprocess.run(["git", "clone", "--quiet", req.repo_value, dest], check=True, timeout=600)
+    subprocess.run(["git", "clone", "--quiet", value, dest], check=True, timeout=600)
     return dest
 
 
@@ -141,32 +157,68 @@ def write_sqlite(files, tables, edges):
 
 
 def run_analysis(req: AnalyzeRequest):
+    global FILE_PATHS
     try:
-        JOB.update(status="running", step="resolving repository", error=None)
-        repo_path = resolve_repo_path(req)
+        JOB.update(status="running", step="resolving repositories", error=None)
 
-        JOB["step"] = "analyzing code (complexity, churn, imports)"
-        code_result = code_analyzers.analyze_codebase(repo_path, lang=req.code_lang)
-        files, code_edges, source_text = code_result["files"], code_result["edges"], code_result["_source_text"]
-        resolved_code_lang = code_result["_code_lang"]
+        repo_slugs_seen = set()
+        repo_specs = []
+        for entry in req.repos:
+            slug = multi_source.slugify(entry.name or entry.value, repo_slugs_seen)
+            path = resolve_repo_path(entry.source, entry.value, slug)
+            repo_specs.append({
+                "slug": slug, "path": path, "code_lang": entry.code_lang,
+                "name": entry.name or os.path.basename(os.path.abspath(path)) or slug,
+            })
 
-        tables, db_edges, code_to_table_edges = [], [], []
-        resolved_db_dialect = None
-        if req.db_source == "connection_string" and req.db_value:
-            JOB["step"] = "introspecting live database"
-            db_result = db_analyzers.analyze_live_db(req.db_value)
-            tables, db_edges = db_result["tables"], db_result["edges"]
-            resolved_db_dialect = db_analyzers.detect_dialect_label(req.db_value)
-        elif req.db_source == "sql_file" and req.db_value:
-            JOB["step"] = "parsing SQL schema file"
-            db_result = db_analyzers.analyze_sql_file(req.db_value, dialect=req.db_dialect)
-            tables, db_edges = db_result["tables"], db_result["edges"]
-            resolved_db_dialect = req.db_dialect
+        JOB["step"] = "analyzing code (complexity, churn, imports, duplication)"
+        code_result = multi_source.analyze_repos(repo_specs)
+        files = code_result["files"]
+        code_edges = code_result["edges"]
+        source_text = code_result["source_text"]
+        FILE_PATHS = code_result["file_paths"]
+        code_langs = code_result["code_langs"]
 
+        db_slugs_seen = set()
+        db_specs = []
+        for entry in req.databases:
+            slug = multi_source.slugify(entry.name or entry.value, db_slugs_seen)
+            db_specs.append({
+                "slug": slug, "source": entry.source, "value": entry.value,
+                "dialect": entry.dialect, "name": entry.name or slug,
+            })
+
+        tables, db_edges, dialects = [], [], {}
+        if db_specs:
+            JOB["step"] = "introspecting databases"
+            db_result = multi_source.analyze_databases(db_specs)
+            tables, db_edges, dialects = db_result["tables"], db_result["edges"], db_result["dialects"]
+
+        code_to_table_edges = []
         if tables:
             JOB["step"] = "linking code to data"
-            table_names = [t["file"] for t in tables]
-            code_to_table_edges = db_analyzers.find_code_to_table_edges(source_text, table_names)
+            # Code references the bare table name ("orders"), not the
+            # namespaced id ("orders-db.orders") — match on bare names, then
+            # expand back to every namespaced table that bare name maps to
+            # (more than one DB source can have a same-named table; when
+            # that happens we link to all of them rather than guess which).
+            bare_to_namespaced = {}
+            for t in tables:
+                bare_to_namespaced.setdefault(t.get("bare_name", t["file"]), []).append(t["file"])
+            raw_edges = db_analyzers.find_code_to_table_edges(source_text, list(bare_to_namespaced))
+            for e in raw_edges:
+                for target_id in bare_to_namespaced.get(e["target"], [e["target"]]):
+                    code_to_table_edges.append({**e, "target": target_id})
+
+        external_context_results = []
+        if req.external_context:
+            JOB["step"] = "fetching Jira/Confluence context"
+            atlassian_email = get_setting("atlassian_email")
+            atlassian_api_token = get_setting("atlassian_api_token")
+            for ctx in req.external_context:
+                external_context_results.append(
+                    external_context.fetch_context(ctx.kind, ctx.url, atlassian_email, atlassian_api_token)
+                )
 
         all_nodes = files + tables
         all_edges = code_edges + db_edges + code_to_table_edges
@@ -174,12 +226,24 @@ def run_analysis(req: AnalyzeRequest):
         JOB["step"] = "writing results"
         write_sqlite(files, tables, all_edges)
 
+        repo_names = [r["name"] for r in repo_specs]
         payload = {
-            "repo": req.repo_name or os.path.basename(os.path.abspath(repo_path)),
+            "repo": " + ".join(repo_names),
+            "repos": [
+                {"slug": r["slug"], "name": r["name"], "code_lang": code_langs.get(r["slug"], r["code_lang"])}
+                for r in repo_specs
+            ],
+            "databases": [
+                {"slug": d["slug"], "name": d["name"], "dialect": dialects.get(d["slug"], d["dialect"])}
+                for d in db_specs
+            ],
             "generated_at": datetime.now(timezone.utc).isoformat(),
             "has_db": bool(tables),
-            "code_lang": resolved_code_lang,
-            "db_dialect": resolved_db_dialect,
+            # kept for a single repo/db so existing single-source displays are unchanged;
+            # None when there's more than one — see the "repos"/"databases" lists instead
+            "code_lang": code_langs.get(repo_specs[0]["slug"]) if len(repo_specs) == 1 else None,
+            "db_dialect": dialects.get(db_specs[0]["slug"]) if len(db_specs) == 1 else None,
+            "external_context": external_context_results,
             "summary": {
                 "total_files": len(files),
                 "total_tables": len(tables),
@@ -223,6 +287,26 @@ def metrics():
     return data
 
 
+FILE_SOURCE_MAX_CHARS = 60_000
+
+
+@app.get("/api/file-source")
+def file_source(id: str):
+    """Serves real source for the source-grounded 'Get recommendations' flow.
+    `id` is only ever looked up against FILE_PATHS — a map this server built
+    itself during the last analysis — never treated as a filesystem path, so
+    there's no path-traversal surface no matter what a caller sends."""
+    path = FILE_PATHS.get(id)
+    if not path or not os.path.isfile(path):
+        return {"ok": False, "error": "Source not available for this file (re-run analysis if the repo changed)."}
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as fh:
+            text = fh.read(FILE_SOURCE_MAX_CHARS + 1)
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+    return {"ok": True, "source": text[:FILE_SOURCE_MAX_CHARS], "truncated": len(text) > FILE_SOURCE_MAX_CHARS}
+
+
 class ChatRequest(BaseModel):
     system: str
     messages: list
@@ -251,6 +335,8 @@ class SettingsRequest(BaseModel):
     anthropic_api_key: str | None = None   # empty string / None = leave unchanged
     gemini_api_key: str | None = None
     sarvam_api_key: str | None = None
+    atlassian_email: str | None = None            # Jira + Confluence Cloud share one credential pair
+    atlassian_api_token: str | None = None
 
 
 def _mask(key):
@@ -272,6 +358,13 @@ def get_settings():
             "has_key": has_key,
             "key_preview": _mask(stored_key),
         }
+    stored_email = get_setting("atlassian_email", "")
+    stored_token = get_setting("atlassian_api_token", "")
+    out["atlassian"] = {
+        "email": stored_email,
+        "has_token": bool(stored_token),
+        "token_preview": _mask(stored_token),
+    }
     return out
 
 
@@ -286,6 +379,10 @@ def save_settings(req: SettingsRequest):
         key = getattr(req, f"{provider}_api_key")
         if key:  # only overwrite if the user actually typed something
             set_setting(f"{provider}_api_key", key)
+    if req.atlassian_email is not None:
+        set_setting("atlassian_email", req.atlassian_email)
+    if req.atlassian_api_token:  # only overwrite if the user actually typed something
+        set_setting("atlassian_api_token", req.atlassian_api_token)
     return {"ok": True}
 
 

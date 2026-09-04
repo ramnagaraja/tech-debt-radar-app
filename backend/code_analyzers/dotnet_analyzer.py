@@ -26,12 +26,13 @@ TOOL_DIR = BACKEND_DIR / "dotnet_tools" / "CodeMetrics"
 
 EXCLUDE_DIRS = {".git", "bin", "obj", "node_modules", "packages", ".vs"}
 
-REQUIRED_FILE_KEYS = (
-    "loc", "sloc", "avg_complexity", "max_complexity", "maintainability_index",
-    "function_count", "security_issue_count", "security_high_count",
-    "security_weighted", "security_issues", "long_function_count",
-    "max_nesting_depth", "many_params_count", "god_file",
-)
+DEFAULT_FILE_METRICS = {
+    "loc": 0, "sloc": 0, "avg_complexity": 0, "max_complexity": 0, "maintainability_index": 100,
+    "function_count": 0, "security_issue_count": 0, "security_high_count": 0,
+    "security_weighted": 0, "security_issues": [], "long_function_count": 0,
+    "max_nesting_depth": 0, "many_params_count": 0, "god_file": False,
+    "function_hashes": [], "public_function_count": 0, "long_conditional_chain_count": 0,
+}
 
 
 class DotnetToolError(RuntimeError):
@@ -88,9 +89,10 @@ def run_roslyn_tool(repo_path, timeout=600):
             return json.load(fh)
 
 
-def analyze_codebase(repo_path):
-    """Returns {'files': [...], 'edges': [...], '_source_text': {rel: src}}
-    — same contract as python_analyzer.analyze_codebase."""
+def collect_metrics(repo_path):
+    """Returns {'metrics': {rel: {...}}, 'edges': [...], 'source_text': {...}}
+    — everything analyze_codebase() computes, but *before* scoring. See
+    python_analyzer.collect_metrics for why this split exists."""
     files = find_cs_files(repo_path)
     rel_files = [rel for _, rel in files]
 
@@ -111,11 +113,16 @@ def analyze_codebase(repo_path):
     metrics = {}
     for rel in rel_files:
         raw = tool_files.get(rel, {})
-        m = {key: raw.get(key, 0 if key not in ("security_issues", "god_file") else ([] if key == "security_issues" else False))
-             for key in REQUIRED_FILE_KEYS}
-        m["maintainability_index"] = raw.get("maintainability_index", 100)
+        m = {key: raw.get(key, default) for key, default in DEFAULT_FILE_METRICS.items()}
         m["churn"] = churn.get(rel, 0)
         metrics[rel] = m
 
-    rows = scoring.compute_debt_scores(metrics, edges)
-    return {"files": rows, "edges": edges, "_source_text": source_text}
+    return {"metrics": metrics, "edges": edges, "source_text": source_text}
+
+
+def analyze_codebase(repo_path):
+    """Returns {'files': [...], 'edges': [...], '_source_text': {rel: src}}
+    — same contract as python_analyzer.analyze_codebase."""
+    collected = collect_metrics(repo_path)
+    rows = scoring.compute_debt_scores(collected["metrics"], collected["edges"])
+    return {"files": rows, "edges": collected["edges"], "_source_text": collected["source_text"]}
