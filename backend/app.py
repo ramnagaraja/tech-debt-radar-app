@@ -11,6 +11,7 @@ import json
 import os
 import shutil
 import sqlite3
+import stat
 import subprocess
 import tempfile
 import threading
@@ -83,7 +84,7 @@ class RepoEntry(BaseModel):
     name: str | None = None
     source: str             # "local" | "git_url" — "local" also covers UNC/network paths, just a filesystem path
     value: str               # a filesystem path (local or \\server\share\...), or a git URL
-    code_lang: str = "auto"  # "auto" | "python" | "dotnet"
+    code_lang: str = "auto"  # "auto" | "python" | "dotnet" | "typescript"
 
 
 class DbEntry(BaseModel):
@@ -104,6 +105,21 @@ class AnalyzeRequest(BaseModel):
     external_context: list[ExternalContextEntry] = []
 
 
+def _rmtree_readonly_safe(path):
+    """git marks objects/pack/*.idx and *.pack files read-only on Windows,
+    and shutil.rmtree() doesn't clear that bit before trying to unlink them —
+    it just raises PermissionError ([WinError 5] Access is denied) on any
+    previously-cloned repo's .git directory. Clear the bit and retry once
+    per failing path; a no-op on platforms where this was never an issue."""
+    def _on_error(func, failed_path, exc_info):
+        try:
+            os.chmod(failed_path, stat.S_IWRITE)
+            func(failed_path)
+        except Exception:
+            pass
+    shutil.rmtree(path, onerror=_on_error)
+
+
 def resolve_repo_path(source: str, value: str, slug: str) -> str:
     if source == "local":
         if not os.path.isdir(value):
@@ -112,7 +128,7 @@ def resolve_repo_path(source: str, value: str, slug: str) -> str:
     # git_url
     dest = str(CLONE_DIR / slug)
     if os.path.isdir(dest):
-        shutil.rmtree(dest)
+        _rmtree_readonly_safe(dest)
     subprocess.run(["git", "clone", "--quiet", value, dest], check=True, timeout=600)
     return dest
 
@@ -178,6 +194,7 @@ def run_analysis(req: AnalyzeRequest):
         source_text = code_result["source_text"]
         FILE_PATHS = code_result["file_paths"]
         code_langs = code_result["code_langs"]
+        frameworks = code_result["frameworks"]
 
         db_slugs_seen = set()
         db_specs = []
@@ -230,7 +247,11 @@ def run_analysis(req: AnalyzeRequest):
         payload = {
             "repo": " + ".join(repo_names),
             "repos": [
-                {"slug": r["slug"], "name": r["name"], "code_lang": code_langs.get(r["slug"], r["code_lang"])}
+                {
+                    "slug": r["slug"], "name": r["name"],
+                    "code_langs": code_langs.get(r["slug"], [r["code_lang"]]),
+                    "frameworks": frameworks.get(r["slug"], {}),
+                }
                 for r in repo_specs
             ],
             "databases": [
@@ -240,8 +261,11 @@ def run_analysis(req: AnalyzeRequest):
             "generated_at": datetime.now(timezone.utc).isoformat(),
             "has_db": bool(tables),
             # kept for a single repo/db so existing single-source displays are unchanged;
-            # None when there's more than one — see the "repos"/"databases" lists instead
-            "code_lang": code_langs.get(repo_specs[0]["slug"]) if len(repo_specs) == 1 else None,
+            # empty/None when there's more than one — see the "repos"/"databases" lists instead.
+            # A repo can itself be more than one language (e.g. .NET + a JS/TS frontend
+            # folder), so this is a list even in the single-repo case.
+            "code_langs": code_langs.get(repo_specs[0]["slug"], []) if len(repo_specs) == 1 else [],
+            "frameworks": frameworks.get(repo_specs[0]["slug"], {}) if len(repo_specs) == 1 else {},
             "db_dialect": dialects.get(db_specs[0]["slug"]) if len(db_specs) == 1 else None,
             "external_context": external_context_results,
             "summary": {

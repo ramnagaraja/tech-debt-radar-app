@@ -119,13 +119,24 @@ export default function SetupScreen({ onReady }) {
                     { id: "auto", label: "Auto-detect", icon: Sparkles },
                     { id: "python", label: "Python", icon: Code2 },
                     { id: "dotnet", label: ".NET", icon: Code2 },
+                    { id: "typescript", label: "TypeScript", icon: Code2 },
                   ]}
                   value={repo.code_lang} onChange={(v) => repoOps.update(repo._id, { code_lang: v })}
                 />
               </div>
+              {repo.code_lang === "auto" && (
+                <p style={{ fontSize: 11.5, color: "#93A7BF", marginTop: 2, marginBottom: 0 }}>
+                  Detects every language actually present, not just one — a .NET backend with a separate JS/TS frontend folder in the same repo gets both analyzed together, no need to split them into separate entries.
+                </p>
+              )}
               {repo.code_lang === "dotnet" && (
                 <p style={{ fontSize: 11.5, color: "#93A7BF", marginTop: 2, marginBottom: 0 }}>
                   Uses a Roslyn-based analyzer — requires the .NET SDK on this machine and this repo's packages already restored (<code>dotnet restore</code>).
+                </p>
+              )}
+              {repo.code_lang === "typescript" && (
+                <p style={{ fontSize: 11.5, color: "#93A7BF", marginTop: 2, marginBottom: 0 }}>
+                  React, Angular, plain JavaScript, or generic TypeScript — auto-detected. Uses a real TypeScript-compiler analyzer and checks against the attached front-end design practices (strict typing, SOLID-adjacent patterns, immutability). The bundled tool installs its own dependencies on first use; nothing to set up in this repo itself.
                 </p>
               )}
             </EntryCard>

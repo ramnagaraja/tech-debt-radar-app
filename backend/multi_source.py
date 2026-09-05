@@ -44,25 +44,41 @@ def analyze_repos(repo_specs):
     resolved to a real filesystem directory (cloned, or a local/network path
     as given). Returns {"files": [...scored rows...], "edges": [...],
     "source_text": {namespaced_id: src}, "file_paths": {namespaced_id: abs_path},
-    "code_langs": {slug: resolved_lang}}."""
+    "code_langs": {slug: [resolved_lang, ...]}, "frameworks": {slug: {lang: framework}}}.
+
+    Each repo can itself be more than one language (e.g. a .NET backend
+    alongside a separate JS/TS frontend folder) — every language
+    code_analyzers.detect_languages() finds gets its own analyzer run
+    against the *same* repo path (no subfolder scoping needed: each
+    analyzer only ever collects its own file extensions, e.g. the .NET
+    analyzer only ever finds .cs files, so running two analyzers over the
+    same root can't collide or double-count) and all of them merge into
+    that one repo's contribution before the cross-repo namespacing below."""
     single = len(repo_specs) == 1
     combined_metrics, combined_edges, combined_source_text = {}, [], {}
-    file_paths, code_langs = {}, {}
+    file_paths, code_langs, frameworks = {}, {}, {}
 
     for spec in repo_specs:
         slug, path, code_lang = spec["slug"], spec["path"], spec["code_lang"]
-        collected = code_analyzers.collect_metrics(path, lang=code_lang)
-        code_langs[slug] = collected["_code_lang"]
+        langs = [code_lang] if code_lang != "auto" else sorted(code_analyzers.detect_languages(path))
         prefix = "" if single else f"{slug}/"
 
-        for rel, m in collected["metrics"].items():
-            new_id = prefix + rel
-            combined_metrics[new_id] = m
-            file_paths[new_id] = os.path.normpath(os.path.join(path, rel))
-        for rel, src in collected["source_text"].items():
-            combined_source_text[prefix + rel] = src
-        for e in collected["edges"]:
-            combined_edges.append({**e, "source": prefix + e["source"], "target": prefix + e["target"]})
+        code_langs[slug] = langs
+        frameworks[slug] = {}
+
+        for lang in langs:
+            collected = code_analyzers.collect_metrics(path, lang=lang)
+            if collected.get("framework"):
+                frameworks[slug][collected["_code_lang"]] = collected["framework"]
+
+            for rel, m in collected["metrics"].items():
+                new_id = prefix + rel
+                combined_metrics[new_id] = m
+                file_paths[new_id] = os.path.normpath(os.path.join(path, rel))
+            for rel, src in collected["source_text"].items():
+                combined_source_text[prefix + rel] = src
+            for e in collected["edges"]:
+                combined_edges.append({**e, "source": prefix + e["source"], "target": prefix + e["target"]})
 
     rows = code_scoring.compute_debt_scores(combined_metrics, combined_edges)
     solo_slug = repo_specs[0]["slug"] if repo_specs else None
@@ -71,7 +87,7 @@ def analyze_repos(repo_specs):
 
     return {
         "files": rows, "edges": combined_edges, "source_text": combined_source_text,
-        "file_paths": file_paths, "code_langs": code_langs,
+        "file_paths": file_paths, "code_langs": code_langs, "frameworks": frameworks,
     }
 
 

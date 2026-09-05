@@ -101,8 +101,8 @@ function InfoIcon({ text, size = 12 }) {
 }
 
 const CODE_METRIC_INFO = {
-  loc: "Total lines of code in the file, including blank lines and comments (radon for Python, Roslyn for .NET). Used as the treemap tile size — bigger files are easier to spot at a glance.",
-  avg_complexity: "Average cyclomatic complexity across all functions in this file (radon for Python, Roslyn for .NET). Cyclomatic complexity counts independent decision paths (if/for/while/catch branches) — more branching means a higher number. Above ~10 per function is generally considered hard to test and maintain.",
+  loc: "Total lines of code in the file, including blank lines and comments (radon for Python, Roslyn for .NET, the TypeScript compiler for TS/React/Angular). Used as the treemap tile size — bigger files are easier to spot at a glance.",
+  avg_complexity: "Average cyclomatic complexity across all functions in this file (radon for Python, Roslyn for .NET, the TypeScript compiler for TS/React/Angular). Cyclomatic complexity counts independent decision paths (if/for/while/catch branches) — more branching means a higher number. Above ~10 per function is generally considered hard to test and maintain.",
   max_complexity: "The single most complex function in this file — its highest cyclomatic complexity score. A high max with a low average usually means one function needs breaking up, even if the rest of the file looks fine.",
   maintainability_index: "A 0–100 composite score computed from Halstead volume, cyclomatic complexity, and lines of code together. Below 65 is generally considered hard to maintain; below 20 is very difficult. This is the single biggest input to the 'design' slice of the debt score.",
   churn: "Number of commits touching this file in the last 2 years, from git log. Frequently-changed files carry more risk per edit and are weighted into the debt score — a file that's both complex AND frequently touched is the classic hotspot.",
@@ -110,11 +110,15 @@ const CODE_METRIC_INFO = {
   max_nesting_depth: "The deepest level of nested if/for/while/try blocks found in any function in this file. Deep nesting (past ~4 levels) makes code hard to follow and easy to break; also feeds the design score.",
   many_params_count: "Functions with more than 5 parameters in this file — often a sign a function is doing too much and would benefit from being split or taking a parameter object instead.",
   duplicate_function_count: "Functions in this file whose structure matches a function elsewhere in this analysis — identifiers and literals are ignored, so a copy-paste with renamed variables still counts. Compared across every repo in this run, not just this file — a reusability signal: the same logic living in two places instead of one.",
-  public_function_count: "Public functions/methods declared in this file (module-level defs in Python; public methods in .NET). A high count on one file is a rough single-responsibility proxy — it may be doing several unrelated jobs that could be split into smaller, more focused units.",
+  public_function_count: "Public functions/methods declared in this file (module-level defs in Python; public methods in .NET; exported functions/classes in TypeScript — a module's actual visibility unit). A high count on one file is a rough single-responsibility proxy — it may be doing several unrelated jobs that could be split into smaller, more focused units.",
   long_conditional_chain_count: "if/elif (or switch/match) chains in this file with more than 5 branches. A classic open/closed-principle smell — this dispatch logic often reads more clearly, and is easier to extend, as polymorphism or a lookup table instead.",
+  any_usage_count: "TypeScript only. Count of explicit ': any' type annotations and 'as any' casts. Each one is a hole in the type system the compiler can no longer check — the design-practices doc's top rule is 'avoid using any; prefer unknown, narrowed via a type guard'.",
+  non_strict_typescript: "TypeScript only. Whether this repo's tsconfig.json has \"strict\": true (or noImplicitAny + strictNullChecks individually). A repo-wide fact applied to every file in it, not something unique to this one file.",
+  static_utility_class_count: "TypeScript/JavaScript. Exported classes in this file where every member is 'static' — a 'sprawling static utility class' the design-practices doc calls out; plain exported functions are more tree-shakable and just as reusable.",
+  many_boolean_props_count: "TypeScript only. React '*Props' interfaces with more than 4 boolean members, or Angular components with more than 4 boolean @Input()s — the design-practices doc's 'avoid dozens of boolean flags; prefer control inversion via slotting' made concrete.",
   fan_out: "Number of other files this file imports from (or references, for .NET). High fan-out means this file depends on a lot of moving parts — changes elsewhere in the codebase are more likely to affect it.",
   fan_in: "Number of other files that import/reference this one — its 'blast radius'. High fan-in means changes to this file are more likely to ripple outward and break something else; a good signal for prioritizing what to make safe to change first.",
-  security_issue_count: "Total findings from real static analysis run against this file (bandit for Python; a Roslyn semantic-analysis pass for .NET — SQL injection patterns, weak crypto, hardcoded secrets, insecure deserialization, command injection). Each finding has a severity (LOW/MEDIUM/HIGH) and a confidence level, both of which weight how much they move the debt score.",
+  security_issue_count: "Total findings from real static analysis run against this file (bandit for Python; a Roslyn semantic-analysis pass for .NET; a syntactic TypeScript-AST pass for TS/React/Angular — SQL injection, XSS via dangerouslySetInnerHTML/innerHTML, Angular sanitizer bypasses, weak crypto, hardcoded secrets, insecure deserialization, command injection). Each finding has a severity (LOW/MEDIUM/HIGH) and a confidence level, both of which weight how much they move the debt score.",
 };
 
 const DB_METRIC_INFO = {
@@ -381,6 +385,36 @@ function nodeRadius(d) {
   return Math.max(7, Math.min(22, 7 + Math.sqrt(degree) * 3.2));
 }
 
+// Condensed from the team's attached "Front End Design Practices" document —
+// used verbatim in the recommendation system prompt for .ts/.tsx files so the
+// AI's critique is grounded in the team's own stated practices, not generic
+// training-data React/Angular advice.
+const FRONTEND_DESIGN_PRACTICES = `Front-end design practices this team follows:
+
+Universal TypeScript:
+- Strict type checking ("strict": true, noImplicitAny, strictNullChecks, noUncheckedIndexedAccess). Avoid "any"; prefer "unknown" narrowed via type guards or a validation library (e.g. Zod).
+- Domain-driven typing over primitives: discriminated unions for multi-state flows (Idle | Loading | Success | Error), branded types for entity IDs to prevent mismatched-ID bugs.
+- Separate DTOs (API contracts) from client-side domain models; map at the boundary so breaking API changes don't propagate into components.
+- Folder-by-feature (features/billing/) over folder-by-technical-role (a top-level components/), with a public barrel index.ts per feature.
+
+React patterns:
+- Container/Presentational (smart vs. dumb): presentational components render from props only; containers (or custom hooks) own data fetching, side effects, and state mutation.
+- Custom hooks for logic decoupling (useUserPermissions(), useDebounce()) — prefer hooks over legacy HOCs and render props.
+- Compound components (Tabs, Accordion, Dropdown) sharing state via Context, not prop drilling.
+- State colocation: keep state as close as possible to where it's used; don't push transient state (modal toggles, form inputs) to a global store.
+- Control inversion via slotting: pass JSX as props/children rather than a config object with dozens of boolean flags.
+
+Angular patterns:
+- Signals-based reactivity (signal(), computed(), effect()) over zone-based dirty checking or complex RxJS operator chains.
+- Facade pattern: components talk only to a Facade service, which exposes read-only signals/observables and command methods, mediating RxJS/NgRx/HTTP underneath.
+- Smart (routed) vs. dumb (presentational) components — dumb components use explicit input()/output() and ChangeDetectionStrategy.OnPush.
+- DI tokens (InjectionToken) to abstract external integrations/config, enabling mock injection and runtime strategy swaps.
+- Functional interceptors (HttpInterceptorFn) and guards (CanActivateFn) over class-based ones.
+
+State management: server state via TanStack Query (React) / TanStack Query Angular or RxJS caching (Angular) — stale-while-revalidate, retries, cache invalidation by key. Global client state via Zustand/Jotai (React) or NgRx SignalStore/BehaviorSubject services (Angular) — immutability, command-query separation, single source of truth. Local/form state via React Hook Form + Zod (React) or Angular Reactive/Typed Forms (Angular) — schema-driven validation.
+
+Performance & maintainability: lazy-load and code-split at routing boundaries (React.lazy/Suspense; Angular loadComponent/loadChildren, @defer). Favor tree-shakable pure functions/ESM exports over sprawling static utility classes. Never mutate state/arrays directly — use immutable updates (spread, or Immer) to preserve reference-identity checks across renders.`;
+
 function buildNodeRecommendationPrompt(data, node, outs, ins, sourceCode) {
   const isTable = node.kind === "table";
   const lines = [`Item: ${node.id} (${isTable ? "database table" : "code file"})`, `Debt score: ${node.debt_score}`];
@@ -388,6 +422,9 @@ function buildNodeRecommendationPrompt(data, node, outs, ins, sourceCode) {
     lines.push(`Avg complexity: ${node.avg_complexity} | Max complexity: ${node.max_complexity} | Maintainability index: ${node.maintainability_index}`);
     lines.push(`Churn (2yr commits): ${node.churn} | Long functions: ${node.long_function_count} | Max nesting depth: ${node.max_nesting_depth} | God file: ${node.god_file}`);
     lines.push(`Duplicate/near-duplicate functions (matched elsewhere in this analysis): ${node.duplicate_function_count ?? 0} | Public functions/methods: ${node.public_function_count ?? 0} | Long if/switch chains (>5 branches): ${node.long_conditional_chain_count ?? 0}`);
+    if (/\.[jt]sx?$/.test(node.id)) {
+      lines.push(`'any' usages: ${node.any_usage_count ?? 0} | tsconfig strict mode off: ${node.non_strict_typescript ? "yes" : "no"} | All-static utility classes: ${node.static_utility_class_count ?? 0} | Components/props with >4 boolean flags: ${node.many_boolean_props_count ?? 0}`);
+    }
     if (node.security_issue_count > 0) {
       lines.push(`Security findings (${node.security_issue_count}, ${node.security_high_count} high):`);
       (node.security_issues || []).forEach((iss) => lines.push(`  - [${iss.severity}] ${iss.test_id}: ${iss.text} (line ${iss.line})`));
@@ -445,6 +482,10 @@ function FullGraphTab({ nodesById, edges, data, focal, setFocal, filterKind, emp
     return m;
   }, [nodes]);
 
+  function isTypescriptFile(node) {
+    return node.kind !== "table" && /\.[jt]sx?$/.test(node.id);
+  }
+
   async function getRecommendations(node, outs, ins) {
     setRecommendation({ forId: node.id, loading: true, text: "", error: false });
     try {
@@ -460,9 +501,18 @@ function FullGraphTab({ nodesById, edges, data, focal, setFocal, filterKind, emp
       }
 
       const prompt = buildNodeRecommendationPrompt(data, node, outs, ins, sourceCode);
-      const systemPrompt = sourceCode
-        ? "You are a staff engineer giving remediation guidance for one specific code file in an engineering-debt dashboard, and you have been given its real source code below the metrics. Use the metrics as signal for WHAT to focus on, and the real source for HOW to fix it. Structure your answer in markdown with these sections: '## What's driving the debt score' (2-3 sentences tying the score components to what you see in the actual code), '## SOLID / design-pattern / reusability critique' (call out specific violations you can see in the real code — SRP, OCP, duplicated logic, tight coupling — not generic principles), '## Recommended fixes' (a prioritized numbered list, most impactful first, each with a one-line why and, where it clarifies the fix, a short before/after fenced code block quoting the actual lines), and '## Quick win' (the single smallest change that would help soonest). End with a line of the exact form '**Confidence: High|Medium|Low** — <one short reason>'. Ground every suggestion in the actual code shown — never invent code that isn't there."
-        : "You are a staff engineer giving remediation guidance for one specific file or database table in an engineering-debt dashboard. Use ONLY the data given — never invent metrics. Structure your answer in markdown with these sections: '## What's driving the debt score' (2-3 sentences tying the score components to what you see), '## Recommended fixes' (a prioritized numbered list, most impactful first, each with a one-line why), and '## Quick win' (the single smallest change that would help soonest). End with a line of the exact form '**Confidence: High|Medium|Low** — <one short reason>' reflecting how directly the data supports these recommendations. Be concrete and specific to the actual metrics/issues listed, not generic advice.";
+      let systemPrompt;
+      if (sourceCode && isTypescriptFile(node)) {
+        systemPrompt =
+          "You are a staff frontend engineer giving remediation guidance for one specific TypeScript file (React, Angular, or generic) in an engineering-debt dashboard, and you have been given its real source code below the metrics. Use the metrics as signal for WHAT to focus on, and the real source for HOW to fix it. Judge the code against the team's own front-end design practices, quoted in full below — cite the specific practice a piece of code violates, don't just say 'follow best practices'. Structure your answer in markdown with these sections: '## What's driving the debt score' (2-3 sentences tying the score components to what you see in the actual code), '## Design-practice critique' (call out specific violations of the practices below you can see in the real code — strict typing, container/presentational or smart/dumb separation, hooks vs HOCs, Signals vs zone-based reactivity, state colocation, DI tokens, immutability, tree-shakability — whichever actually apply to this file, not a generic checklist), '## Recommended fixes' (a prioritized numbered list, most impactful first, each with a one-line why and, where it clarifies the fix, a short before/after fenced code block quoting the actual lines), and '## Quick win' (the single smallest change that would help soonest). End with a line of the exact form '**Confidence: High|Medium|Low** — <one short reason>'. Ground every suggestion in the actual code shown — never invent code that isn't there.\n\n"
+          + FRONTEND_DESIGN_PRACTICES;
+      } else if (sourceCode) {
+        systemPrompt =
+          "You are a staff engineer giving remediation guidance for one specific code file in an engineering-debt dashboard, and you have been given its real source code below the metrics. Use the metrics as signal for WHAT to focus on, and the real source for HOW to fix it. Structure your answer in markdown with these sections: '## What's driving the debt score' (2-3 sentences tying the score components to what you see in the actual code), '## SOLID / design-pattern / reusability critique' (call out specific violations you can see in the real code — SRP, OCP, duplicated logic, tight coupling — not generic principles), '## Recommended fixes' (a prioritized numbered list, most impactful first, each with a one-line why and, where it clarifies the fix, a short before/after fenced code block quoting the actual lines), and '## Quick win' (the single smallest change that would help soonest). End with a line of the exact form '**Confidence: High|Medium|Low** — <one short reason>'. Ground every suggestion in the actual code shown — never invent code that isn't there.";
+      } else {
+        systemPrompt =
+          "You are a staff engineer giving remediation guidance for one specific file or database table in an engineering-debt dashboard. Use ONLY the data given — never invent metrics. Structure your answer in markdown with these sections: '## What's driving the debt score' (2-3 sentences tying the score components to what you see), '## Recommended fixes' (a prioritized numbered list, most impactful first, each with a one-line why), and '## Quick win' (the single smallest change that would help soonest). End with a line of the exact form '**Confidence: High|Medium|Low** — <one short reason>' reflecting how directly the data supports these recommendations. Be concrete and specific to the actual metrics/issues listed, not generic advice.";
+      }
 
       const res = await fetch(CHAT_API_URL, {
         method: "POST", headers: { "Content-Type": "application/json" },
@@ -710,9 +760,9 @@ const SAMPLE_QUESTIONS = [
 
 function codebaseTechLine(data) {
   if (data.repos?.length > 1) {
-    return data.repos.map((r) => `${r.name} (${r.code_lang === "dotnet" ? ".NET" : "Python"})`).join(", ");
+    return data.repos.map((r) => `${r.name} (${codeLangsLabel(r.code_langs, r.frameworks)})`).join(", ");
   }
-  return data.code_lang === "dotnet" ? ".NET (C#, analyzed via Roslyn)" : "Python";
+  return codeLangsDescription(data.code_langs, data.frameworks);
 }
 
 function databaseLine(data) {
@@ -980,8 +1030,8 @@ export default function Dashboard({ data, onReanalyze }) {
             <div style={{ fontSize: 11.5, color: "#93A7BF", display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
               <span>repo: {data.repo}{hasDb ? " · db connected" : " · no database analyzed"}</span>
               {(data.repos?.length > 1
-                ? data.repos.map((r) => <TechBadge key={r.slug} label={`${r.name}: ${r.code_lang === "dotnet" ? ".NET" : "Python"}`} />)
-                : data.code_lang && <TechBadge label={data.code_lang === "dotnet" ? ".NET" : "Python"} />)}
+                ? data.repos.map((r) => <TechBadge key={r.slug} label={`${r.name}: ${codeLangsLabel(r.code_langs, r.frameworks)}`} />)
+                : data.code_langs?.length > 0 && <TechBadge label={codeLangsLabel(data.code_langs, data.frameworks)} />)}
               {(data.databases?.length > 1
                 ? data.databases.map((d) => <TechBadge key={d.slug} label={`${d.name}: ${DB_DIALECT_LABELS[d.dialect] || d.dialect}`} />)
                 : data.db_dialect && <TechBadge label={DB_DIALECT_LABELS[data.db_dialect] || data.db_dialect} />)}
@@ -1021,7 +1071,18 @@ export default function Dashboard({ data, onReanalyze }) {
               items={data.files.map((f) => ({ ...f, id: f.file }))} sizeKey="loc" groupByDir
               legendNote="Grouped by folder · tile size = lines of code · color = debt score. Click a tile for detail."
               selected={selectedFile} setSelected={setSelectedFile} goToDeps={goToDeps}
-              detailFields={[["Lines of code", "loc"], ["Avg. complexity", "avg_complexity"], ["Max. complexity", "max_complexity"], ["Maintainability index", "maintainability_index", "0–100, lower is worse"], ["Commits (2yr churn)", "churn"], ["Long functions (>50 lines)", "long_function_count"], ["Max nesting depth", "max_nesting_depth"], ["Many-parameter functions", "many_params_count"], ["Duplicate functions", "duplicate_function_count"], ["Public functions/methods", "public_function_count"], ["Long if/switch chains (>5 branches)", "long_conditional_chain_count"], ["Security findings", "security_issue_count"], ["Depends on", "fan_out"], ["Depended on by", "fan_in"]]}
+              detailFields={[
+                ["Lines of code", "loc"], ["Avg. complexity", "avg_complexity"], ["Max. complexity", "max_complexity"],
+                ["Maintainability index", "maintainability_index", "0–100, lower is worse"], ["Commits (2yr churn)", "churn"],
+                ["Long functions (>50 lines)", "long_function_count"], ["Max nesting depth", "max_nesting_depth"],
+                ["Many-parameter functions", "many_params_count"], ["Duplicate functions", "duplicate_function_count"],
+                ["Public functions/methods", "public_function_count"], ["Long if/switch chains (>5 branches)", "long_conditional_chain_count"],
+                ...(selectedFile && /\.[jt]sx?$/.test(selectedFile.id) ? [
+                  ["'any' usages", "any_usage_count"], ["tsconfig strict mode off", "non_strict_typescript"],
+                  ["All-static utility classes", "static_utility_class_count"], ["Props/inputs with >4 booleans", "many_boolean_props_count"],
+                ] : []),
+                ["Security findings", "security_issue_count"], ["Depends on", "fan_out"], ["Depended on by", "fan_in"],
+              ]}
             />
           )}
           {tab === "db" && (
@@ -1063,6 +1124,36 @@ function NoDbNotice({ onReanalyze }) {
 }
 
 const DB_DIALECT_LABELS = { postgresql: "Postgres", postgres: "Postgres", mysql: "MySQL", mssql: "SQL Server" };
+
+function oneCodeLangLabel(codeLang, framework) {
+  if (codeLang === "dotnet") return ".NET";
+  if (codeLang === "typescript") {
+    if (framework === "react") return "TypeScript (React)";
+    if (framework === "angular") return "TypeScript (Angular)";
+    return "TypeScript";
+  }
+  return "Python";
+}
+
+function oneCodeLangDescription(codeLang, framework) {
+  if (codeLang === "dotnet") return ".NET (C#, analyzed via Roslyn)";
+  if (codeLang === "typescript") {
+    const flavor = framework === "react" ? "React" : framework === "angular" ? "Angular" : "generic";
+    return `TypeScript (${flavor}, analyzed via the TypeScript compiler)`;
+  }
+  return "Python";
+}
+
+// A single repo can itself be more than one language (e.g. a .NET backend
+// alongside a separate JS/TS frontend folder) — codeLangs is a list, frameworks
+// a {lang: framework} map; both join with " + " for display.
+function codeLangsLabel(codeLangs, frameworks = {}) {
+  return (codeLangs || []).map((lang) => oneCodeLangLabel(lang, frameworks[lang])).join(" + ") || "unknown";
+}
+
+function codeLangsDescription(codeLangs, frameworks = {}) {
+  return (codeLangs || []).map((lang) => oneCodeLangDescription(lang, frameworks[lang])).join(" + ") || "unknown";
+}
 
 function TechBadge({ label }) {
   return (

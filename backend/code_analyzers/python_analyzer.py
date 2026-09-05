@@ -132,6 +132,8 @@ def compute_design_smells(full_path, loc):
     empty = {
         "long_function_count": 0, "max_nesting_depth": 0, "many_params_count": 0, "god_file": False,
         "function_hashes": [], "public_function_count": 0, "long_conditional_chain_count": 0,
+        "any_usage_count": 0, "non_strict_typescript": False, "static_utility_class_count": 0,
+        "many_boolean_props_count": 0,
     }
     try:
         with open(full_path, "r", encoding="utf-8", errors="ignore") as fh:
@@ -195,6 +197,9 @@ def compute_design_smells(full_path, loc):
         "function_hashes": function_hashes,
         "public_function_count": public_function_count,
         "long_conditional_chain_count": long_conditional_chain_count,
+        # TypeScript-only signals (see typescript_analyzer.py) — not applicable to Python.
+        "any_usage_count": 0, "non_strict_typescript": False, "static_utility_class_count": 0,
+        "many_boolean_props_count": 0,
     }
 
 

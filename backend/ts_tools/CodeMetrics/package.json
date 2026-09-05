@@ -1,0 +1,11 @@
+{
+  "name": "code-metrics",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Real TypeScript-AST analysis for the debt radar's React/Angular/TypeScript path — shelled out to by code_analyzers/typescript_analyzer.py.",
+  "type": "commonjs",
+  "main": "analyze.js",
+  "dependencies": {
+    "typescript": "^5.7.0"
+  }
+}

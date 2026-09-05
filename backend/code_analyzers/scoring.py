@@ -43,6 +43,12 @@ REQUIRED_METRIC_KEYS = (
     "security_weighted", "security_issues", "long_function_count",
     "max_nesting_depth", "many_params_count", "god_file",
     "function_hashes", "public_function_count", "long_conditional_chain_count",
+    # TypeScript-specific (from the attached Front End Design Practices doc) —
+    # Python/.NET analyzers emit 0 for all four, same pattern as any other
+    # signal that's meaningful to only one language (e.g. bandit vs. Roslyn's
+    # SecurityScanner already differ this way).
+    "any_usage_count", "non_strict_typescript", "static_utility_class_count",
+    "many_boolean_props_count",
 )
 
 def compute_duplicate_counts(metrics_by_rel):
@@ -90,6 +96,10 @@ def compute_debt_scores(metrics_by_rel, edges):
     dup_vals = [duplicate_counts.get(rel, 0) for rel in metrics_by_rel]
     public_surface_vals = [m["public_function_count"] for m in metrics_by_rel.values()]
     long_cond_vals = [m["long_conditional_chain_count"] for m in metrics_by_rel.values()]
+    any_usage_vals = [m["any_usage_count"] for m in metrics_by_rel.values()]
+    non_strict_vals = [1 if m["non_strict_typescript"] else 0 for m in metrics_by_rel.values()]
+    static_util_vals = [m["static_utility_class_count"] for m in metrics_by_rel.values()]
+    bool_props_vals = [m["many_boolean_props_count"] for m in metrics_by_rel.values()]
 
     norm_c = normalize(complexities)
     norm_ch = normalize(churns)
@@ -102,6 +112,10 @@ def compute_debt_scores(metrics_by_rel, edges):
     norm_dup = normalize(dup_vals)
     norm_public = normalize(public_surface_vals)
     norm_cond = normalize(long_cond_vals)
+    norm_any = normalize(any_usage_vals)
+    norm_non_strict = normalize(non_strict_vals)
+    norm_static_util = normalize(static_util_vals)
+    norm_bool_props = normalize(bool_props_vals)
 
     rows = []
     for rel, m in metrics_by_rel.items():
@@ -119,6 +133,10 @@ def compute_debt_scores(metrics_by_rel, edges):
             "duplicate_code": round(norm_dup.get(duplicate_counts.get(rel, 0), 0), 3),
             "high_public_surface": round(norm_public.get(m["public_function_count"], 0), 3),
             "long_conditional_chains": round(norm_cond.get(m["long_conditional_chain_count"], 0), 3),
+            "any_usage": round(norm_any.get(m["any_usage_count"], 0), 3),
+            "non_strict_typescript": round(norm_non_strict.get(1 if m["non_strict_typescript"] else 0, 0), 3),
+            "static_utility_classes": round(norm_static_util.get(m["static_utility_class_count"], 0), 3),
+            "many_boolean_props": round(norm_bool_props.get(m["many_boolean_props_count"], 0), 3),
         }
         design_score = round(sum(design_detail.values()) / len(design_detail), 4)
 
@@ -137,6 +155,10 @@ def compute_debt_scores(metrics_by_rel, edges):
             "duplicate_function_count": duplicate_counts.get(rel, 0),
             "public_function_count": m["public_function_count"],
             "long_conditional_chain_count": m["long_conditional_chain_count"],
+            "any_usage_count": m["any_usage_count"],
+            "non_strict_typescript": m["non_strict_typescript"],
+            "static_utility_class_count": m["static_utility_class_count"],
+            "many_boolean_props_count": m["many_boolean_props_count"],
             "score_breakdown": {"complexity": round(c_score, 3), "churn": round(ch_score, 3),
                                  "security": round(sec_score, 3), "design": design_score,
                                  "design_detail": design_detail},

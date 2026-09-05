@@ -32,6 +32,9 @@ DEFAULT_FILE_METRICS = {
     "security_weighted": 0, "security_issues": [], "long_function_count": 0,
     "max_nesting_depth": 0, "many_params_count": 0, "god_file": False,
     "function_hashes": [], "public_function_count": 0, "long_conditional_chain_count": 0,
+    # TypeScript-only signals (see typescript_analyzer.py) — not applicable to .NET.
+    "any_usage_count": 0, "non_strict_typescript": False, "static_utility_class_count": 0,
+    "many_boolean_props_count": 0,
 }
 
 
