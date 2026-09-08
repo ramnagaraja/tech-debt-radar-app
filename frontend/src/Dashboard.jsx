@@ -6,9 +6,11 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import {
   Flame, GitBranch, MessageCircle, Database, ThumbsUp, ThumbsDown, Search, ArrowRight,
-  Clock, Send, RefreshCw, Info, Sparkles, ShieldAlert, X, Settings, AlertTriangle, Palette,
+  Clock, Send, RefreshCw, Info, Sparkles, ShieldAlert, X, Settings, AlertTriangle, Palette, FileText, Workflow,
+  Check, Loader2,
 } from "lucide-react";
 import AdminPanel from "./AdminPanel.jsx";
+import { STEP_LABELS } from "./SetupScreen.jsx";
 
 const CHAT_API_URL = "/api/chat";
 
@@ -385,6 +387,178 @@ function nodeRadius(d) {
   return Math.max(7, Math.min(22, 7 + Math.sqrt(degree) * 3.2));
 }
 
+// --- Dependency-flow tiering (frontend / backend / database) -------------
+// A heuristic, not a universal fact: a real frontend-language file is an
+// unambiguous signal, but a lot of this app's analyzed repos are
+// server-rendered monoliths with no separate frontend language at all, so a
+// folder-name convention is the fallback for "this is the presentation/entry
+// layer" (e.g. a Python app's own views/ directory). Checked against every
+// path segment, not just the first, so it still works once a repo name
+// namespaces the id (multi-repo runs prefix ids with "reponame/...").
+const FRONTEND_FOLDER_NAMES = new Set(["views", "pages", "templates", "ui", "components", "frontend", "client", "web", "screens"]);
+
+function classifyTier(node) {
+  if (node.kind === "table") return "database";
+  const relPath = node.id || node.file || "";
+  if (/\.[jt]sx?$/.test(relPath)) return "frontend"; // a real frontend-language file
+  const segments = relPath.toLowerCase().split("/");
+  return segments.some((s) => FRONTEND_FOLDER_NAMES.has(s)) ? "frontend" : "backend";
+}
+
+const TIER_ORDER = ["frontend", "backend", "database"];
+const TIER_LABELS = { frontend: "Frontend", backend: "Backend", database: "Database" };
+// Same debt_score formula already used everywhere else in the app (heatmaps,
+// node detail panels) — just averaged across every item placed in this tier,
+// so the basis for this number is never a mystery.
+const TIER_SCORE_INFO = {
+  frontend: "Average of each file's overall debt_score across every item classified into this tier (a real frontend-language file, or a file under a views/pages/components/ui-style folder). Each file's own score is 35% complexity + 20% churn + 25% security + 20% design — see that file's own detail panel for its breakdown.",
+  backend: "Average of each file's overall debt_score across every item classified into this tier (everything not matched as frontend or a database table — core/services/modules-style code). Each file's own score is 35% complexity + 20% churn + 25% security + 20% design — see that file's own detail panel for its breakdown.",
+  database: "Average of each table's overall debt_score across every table in this analysis. Each table's own score is 30% performance (unindexed foreign keys) + 15% size + 30% security (sensitive columns, broad write grants) + 25% design (missing primary key, unenforced relationships, table width) — see that table's own detail panel for its breakdown.",
+};
+const TIER_BAND_FILLS = { frontend: "#EFF6FF", backend: "#F0FDF4", database: "#FDF4FF" };
+
+// Shared between the graph's initial draw and the highlight-pass reset, so a
+// tiered layout's "cross-tier edges are the real story" emphasis survives
+// clicking a node and then clicking away again. Only meaningful once the
+// simulation has resolved link.source/target from ids to node objects.
+function baseEdgeOpacity(d, tiered) {
+  if (tiered && d.source && typeof d.source === "object") {
+    return classifyTier(d.source) === classifyTier(d.target) ? 0.12 : 0.6;
+  }
+  return 0.45;
+}
+function baseEdgeWidth(d, tiered) {
+  if (tiered && d.source && typeof d.source === "object") {
+    return classifyTier(d.source) === classifyTier(d.target) ? 1.2 : 2;
+  }
+  return 1.2;
+}
+
+// --- Knowledge base retrieval (RAG) ---------------------------------------
+// The frontend orchestrates this the same way it already orchestrates
+// /api/file-source and Jira/Confluence context: fetch first, fold into the
+// prompt, then call /api/chat — keeping that endpoint generic. Sources are
+// always shown (not just when the model's prose happens to cite them) so
+// "what the library actually had" stays visible regardless of how the
+// model's answer reads.
+const KB_MIN_SIMILARITY = 0.35; // below this, a match is noise, not a citation
+
+async function searchKnowledgeBase(query, topK = 4) {
+  if (!query || !query.trim()) return [];
+  try {
+    const res = await fetch("/api/knowledge/search", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ query, top_k: topK }),
+    });
+    const json = await res.json();
+    return (json.results || []).filter((r) => r.similarity >= KB_MIN_SIMILARITY);
+  } catch {
+    return []; // no knowledge base yet, or the search failed — grounding still works without it
+  }
+}
+
+function synthesizeKbQuery(node, outs = [], ins = []) {
+  if (!node) return "";
+  if (node.kind === "table") {
+    const bits = ["database schema design", node.missing_primary_key ? "missing primary key" : null,
+      node.high_risk_columns?.length ? "sensitive data columns" : null,
+      node.unenforced_relationships?.length ? "unenforced foreign key relationships" : null];
+    return bits.filter(Boolean).join(" ");
+  }
+  // Translate the same design-smell signals already used for badges into terms
+  // that actually match the bundled SOLID/design-pattern/microservices reference
+  // docs, so "Get recommendations" retrieves real grounding for exactly the kind
+  // of critique its system prompt already asks for, not just team-uploaded docs.
+  const bits = [
+    (node.security_issues || []).map((i) => i.test_id).join(" "),
+    (node.god_file || (node.public_function_count ?? 0) > 15) ? "single responsibility principle god object" : null,
+    node.long_conditional_chain_count ? "open closed principle strategy pattern polymorphism" : null,
+    node.duplicate_function_count ? "DRY duplicated code reusability" : null,
+    node.static_utility_class_count ? "static utility class anti-pattern" : null,
+    node.many_boolean_props_count ? "control inversion boolean flag anti-pattern" : null,
+    ((outs?.length ?? 0) + (ins?.length ?? 0) > 12) ? "microservices coupling bounded context service boundaries" : null,
+  ];
+  return bits.filter(Boolean).join(" ") || node.file;
+}
+
+function confidenceColor(level) {
+  if (level === "High") return { bg: "#E7F9F1", fg: "#0F7B4E" };
+  if (level === "Medium") return { bg: "#FEF3E2", fg: "#B45309" };
+  return { bg: "#F3F4F6", fg: "#6B7280" };
+}
+
+function KnowledgeSourcesPanel({ sources, query }) {
+  const [voted, setVoted] = useState({});
+  if (!sources || sources.length === 0) return null;
+
+  async function vote(chunkId, dir) {
+    setVoted((v) => ({ ...v, [chunkId]: dir }));
+    try {
+      await fetch("/api/knowledge/feedback", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ chunk_id: chunkId, vote: dir, query }),
+      });
+    } catch {
+      // best-effort — the vote just won't count toward future ranking this time
+    }
+  }
+
+  return (
+    <div style={{ marginTop: 10, borderTop: "1px dashed #DCEAF6", paddingTop: 10 }}>
+      <div style={{ fontSize: 11, fontWeight: 700, color: "#5B7290", marginBottom: 6, textTransform: "uppercase", letterSpacing: 0.3 }}>
+        Knowledge base sources
+      </div>
+      {sources.map((s) => {
+        const c = confidenceColor(s.confidence);
+        return (
+          <div key={s.chunk_id} style={{ display: "flex", alignItems: "flex-start", gap: 8, background: "#FBFDFF", border: "1px solid #E1EBF5", borderRadius: 8, padding: "8px 10px", marginBottom: 6 }}>
+            <FileText size={14} color="#93A7BF" style={{ flexShrink: 0, marginTop: 2 }} />
+            <div style={{ flex: 1, minWidth: 0 }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap", marginBottom: 3 }}>
+                <span style={{ fontSize: 12, fontWeight: 600, color: "#0F2540" }}>{s.filename}{s.page ? ` · p.${s.page}` : ""}</span>
+                {s.is_builtin && (
+                  <span title="Bundled with the app — SOLID / design patterns / microservices reference" style={{ fontSize: 9.5, fontWeight: 700, color: "#5B3FA8", background: "#F1ECFB", padding: "1px 6px", borderRadius: 99 }}>
+                    Industry reference
+                  </span>
+                )}
+                <span style={{ fontSize: 9.5, fontWeight: 700, color: c.fg, background: c.bg, padding: "1px 6px", borderRadius: 99 }}>
+                  {s.confidence} match ({Math.round(s.similarity * 100)}%)
+                </span>
+                {s.trust_multiplier !== 1 && (
+                  <span title="Adjusted by past team feedback on this source" style={{ fontSize: 9.5, color: "#93A7BF" }}>
+                    · feedback-adjusted {s.trust_multiplier > 1 ? "↑" : "↓"}
+                  </span>
+                )}
+              </div>
+              <div style={{ fontSize: 11.5, color: "#5B7290", lineHeight: 1.4 }}>{s.text.slice(0, 220)}{s.text.length > 220 ? "…" : ""}</div>
+            </div>
+            <div style={{ display: "flex", gap: 3, flexShrink: 0 }}>
+              <button onClick={() => vote(s.chunk_id, "up")} title="Helpful source"
+                style={{ background: "none", border: "none", cursor: "pointer", padding: 3, color: voted[s.chunk_id] === "up" ? "#0EA5E9" : "#B7C4D6" }}>
+                <ThumbsUp size={13} />
+              </button>
+              <button onClick={() => vote(s.chunk_id, "down")} title="Not helpful"
+                style={{ background: "none", border: "none", cursor: "pointer", padding: 3, color: voted[s.chunk_id] === "down" ? "#DC2626" : "#B7C4D6" }}>
+                <ThumbsDown size={13} />
+              </button>
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+// Shared by the Ask tab and "Get recommendations": a single trailing
+// confidence line can't be pinned to any one claim once an answer covers
+// several distinct findings — exactly when a team most needs to know which
+// specific claims to trust. Requiring the tag (and, where one applies, the
+// citation) on each item instead keeps both traceable to the exact line
+// that earned them, and asking for bold inline tags rather than a table
+// keeps the format identical regardless of which of the three providers
+// (Claude, Gemini, or a local Ollama model) answers it.
+const PER_ITEM_CONFIDENCE_INSTRUCTION = "If the question asks for a specific number of items (e.g. \"top 10\"), produce exactly that many, numbered — never stop early or pad with fewer just because the answer already feels long enough. Every distinct fix, finding, or recommendation in a numbered or bulleted list must end with its own confidence tag in the exact inline form '**(Confidence: High|Medium|Low)**' — reflecting how directly THAT specific item is supported by the data or code actually shown, not one blanket confidence for the whole answer. If, and only if, a specific piece of retrieved reference material genuinely informed that particular item, immediately follow its confidence tag with that item's exact citation tag, e.g. '**(Confidence: High)** [KB-abc123]' — never attach a citation to an item it didn't actually inform, and never fabricate a tag that isn't listed in the reference material given. Prefer a numbered or bulleted list over a table for anything enumerable (e.g. a \"top N\" list of files or fixes) — a table cell can't hold this per-item tag. Only a short answer making one single claim, with no enumerable list, should end with one overall confidence tag in this same form instead. Show any arithmetic (e.g. a projected debt-score improvement) as plain prose or a simple 'a - b = c' line, never LaTeX/math-block notation ($$...$$ or \\text{}) — this renderer displays that literally instead of typesetting it.";
+
 // Condensed from the team's attached "Front End Design Practices" document —
 // used verbatim in the recommendation system prompt for .ts/.tsx files so the
 // AI's critique is grounded in the team's own stated practices, not generic
@@ -457,7 +631,7 @@ const COLOR_BY_OPTIONS = [
   ["security", "Security concerns"],
 ];
 
-function FullGraphTab({ nodesById, edges, data, focal, setFocal, filterKind, emptyLabel }) {
+function FullGraphTab({ nodesById, edges, data, focal, setFocal, filterKind, tiered, emptyLabel }) {
   const svgRef = useRef(null);
   const nodeSelRef = useRef(null);
   const linkSelRef = useRef(null);
@@ -465,7 +639,13 @@ function FullGraphTab({ nodesById, edges, data, focal, setFocal, filterKind, emp
   const zoomRef = useRef(null);
   const [query, setQuery] = useState("");
   const [colorBy, setColorBy] = useState("debt");
-  const [recommendation, setRecommendation] = useState({ forId: null, loading: false, text: "", error: false });
+  const [recommendation, setRecommendation] = useState({ forId: null, loading: false, text: "", error: false, sources: [], kbQuery: "" });
+  const [recVoted, setRecVoted] = useState({}); // { [nodeId]: "up" | "down" } — this session's own votes, for button highlighting
+  const [recentRecDownvotes, setRecentRecDownvotes] = useState([]);
+
+  useEffect(() => {
+    fetch("/api/feedback/recent?vote=down&scope=recommendation&limit=5").then((r) => r.json()).then((d) => setRecentRecDownvotes(d.items || [])).catch(() => {});
+  }, []);
 
   const nodes = useMemo(() => {
     const all = Object.values(nodesById);
@@ -476,6 +656,60 @@ function FullGraphTab({ nodesById, edges, data, focal, setFocal, filterKind, emp
     const base = filterKind ? edges.filter((e) => e.edge_type !== "code_to_table") : edges;
     return base.filter((e) => nodeIdSet.has(e.source) && nodeIdSet.has(e.target));
   }, [edges, filterKind, nodeIdSet]);
+
+  // Per-tier summary strip (tiered layout only) — average debt + node count
+  // per tier, so where debt concentrates along the flow is visible without
+  // clicking into individual nodes.
+  const tierSummary = useMemo(() => {
+    if (!tiered) return null;
+    const byTier = { frontend: [], backend: [], database: [] };
+    for (const n of nodes) byTier[classifyTier(n)].push(n);
+    return TIER_ORDER.map((t) => ({
+      tier: t, count: byTier[t].length,
+      avgDebt: byTier[t].length ? byTier[t].reduce((s, n) => s + (n.debt_score || 0), 0) / byTier[t].length : null,
+    })).filter((t) => t.count > 0);
+  }, [tiered, nodes]);
+
+  // Repo <-> database links (tiered layout only, and only when there's more
+  // than one repo or more than one database — a single-repo/single-db run
+  // has nothing to disambiguate). Derived entirely from code_to_table edges
+  // already in the payload: an edge's source is a repo-namespaced file id,
+  // its target resolves to a table row whose "db" field names the owning
+  // database (multi_source.py sets this unconditionally) — so which repo
+  // actually talks to which database falls out of data already computed,
+  // no new setup step needed.
+  const repoDbLinks = useMemo(() => {
+    if (!tiered) return null;
+    const repos = data.repos || [];
+    const databases = data.databases || [];
+    if (repos.length <= 1 && databases.length <= 1) return null;
+
+    const tableById = {};
+    for (const t of (data.tables || [])) tableById[t.file] = t;
+    const dbNameBySlug = {};
+    for (const d of databases) dbNameBySlug[d.slug] = d.name;
+
+    const referencedDbSlugs = new Set();
+    const perRepo = repos.map((r) => {
+      const prefix = repos.length > 1 ? `${r.slug}/` : null;
+      const tablesByDb = {}; // dbSlug -> Set(table ids)
+      for (const e of scopedEdges) {
+        if (e.edge_type !== "code_to_table") continue;
+        if (prefix && !e.source.startsWith(prefix)) continue;
+        const table = tableById[e.target];
+        if (!table) continue;
+        referencedDbSlugs.add(table.db);
+        (tablesByDb[table.db] = tablesByDb[table.db] || new Set()).add(e.target);
+      }
+      const links = Object.entries(tablesByDb).map(([slug, tables]) => ({
+        slug, name: dbNameBySlug[slug] || slug, tableCount: tables.size,
+      }));
+      return { repo: r, links };
+    });
+    const orphanDbs = databases.filter((d) => !referencedDbSlugs.has(d.slug));
+    return { perRepo, orphanDbs };
+  }, [tiered, data, scopedEdges]);
+
   const scopedNodesById = useMemo(() => {
     const m = {};
     for (const n of nodes) m[n.id] = n;
@@ -487,7 +721,7 @@ function FullGraphTab({ nodesById, edges, data, focal, setFocal, filterKind, emp
   }
 
   async function getRecommendations(node, outs, ins) {
-    setRecommendation({ forId: node.id, loading: true, text: "", error: false });
+    setRecommendation({ forId: node.id, loading: true, text: "", error: false, sources: [], kbQuery: "" });
     try {
       let sourceCode = null;
       if (node.kind !== "table") {
@@ -500,34 +734,79 @@ function FullGraphTab({ nodesById, edges, data, focal, setFocal, filterKind, emp
         }
       }
 
-      const prompt = buildNodeRecommendationPrompt(data, node, outs, ins, sourceCode);
+      const kbQuery = synthesizeKbQuery(node, outs, ins);
+      const kbSources = await searchKnowledgeBase(kbQuery);
+      const kbSection = kbSources.length
+        ? `\n\nReference material retrieved from the knowledge base — a mix of the team's own uploaded documents and this app's bundled industry-standard references on SOLID, design patterns, and microservices architecture (cite by its [KB-...] tag when you use it — don't invent a citation for anything not listed here):\n${kbSources.map((s) => `[KB-${s.chunk_id}] ${s.filename}${s.page ? ` (p.${s.page})` : ""}: ${s.text}`).join("\n\n")}`
+        : "";
+
+      // Same in-context conditioning loop as the Ask tab (ChatTab.recentDownvotes)
+      // applied to recommendations: a real, persisted vote log changes the very
+      // next recommendation's prompt. This is NOT gradient-based reinforcement
+      // learning — no model weights are updated.
+      const feedbackNote = recentRecDownvotes.length
+        ? `\n\nThe team has previously down-voted these recommendations as unhelpful — avoid repeating the same mistakes (vague claims, missing specifics, ignoring a relevant metric or reference):\n${recentRecDownvotes.map((f, i) => `${i + 1}. For "${f.question}", the down-voted recommendation was: "${f.answer.slice(0, 200)}..."`).join("\n")}`
+        : "";
+
+      const prompt = buildNodeRecommendationPrompt(data, node, outs, ins, sourceCode) + kbSection;
       let systemPrompt;
       if (sourceCode && isTypescriptFile(node)) {
         systemPrompt =
-          "You are a staff frontend engineer giving remediation guidance for one specific TypeScript file (React, Angular, or generic) in an engineering-debt dashboard, and you have been given its real source code below the metrics. Use the metrics as signal for WHAT to focus on, and the real source for HOW to fix it. Judge the code against the team's own front-end design practices, quoted in full below — cite the specific practice a piece of code violates, don't just say 'follow best practices'. Structure your answer in markdown with these sections: '## What's driving the debt score' (2-3 sentences tying the score components to what you see in the actual code), '## Design-practice critique' (call out specific violations of the practices below you can see in the real code — strict typing, container/presentational or smart/dumb separation, hooks vs HOCs, Signals vs zone-based reactivity, state colocation, DI tokens, immutability, tree-shakability — whichever actually apply to this file, not a generic checklist), '## Recommended fixes' (a prioritized numbered list, most impactful first, each with a one-line why and, where it clarifies the fix, a short before/after fenced code block quoting the actual lines), and '## Quick win' (the single smallest change that would help soonest). End with a line of the exact form '**Confidence: High|Medium|Low** — <one short reason>'. Ground every suggestion in the actual code shown — never invent code that isn't there.\n\n"
+          "You are a staff frontend engineer giving remediation guidance for one specific TypeScript file (React, Angular, or generic) in an engineering-debt dashboard, and you have been given its real source code below the metrics. Use the metrics as signal for WHAT to focus on, and the real source for HOW to fix it. Judge the code against the team's own front-end design practices, quoted in full below — cite the specific practice a piece of code violates, don't just say 'follow best practices'. Structure your answer in markdown with these sections: '## What's driving the debt score' (2-3 sentences tying the score components to what you see in the actual code), '## Design-practice critique' (call out specific violations of the practices below you can see in the real code — strict typing, container/presentational or smart/dumb separation, hooks vs HOCs, Signals vs zone-based reactivity, state colocation, DI tokens, immutability, tree-shakability — whichever actually apply to this file, not a generic checklist), '## Recommended fixes' (a prioritized numbered list, most impactful first, each with a one-line why and, where it clarifies the fix, a short before/after fenced code block quoting the actual lines), and '## Quick win' (the single smallest change that would help soonest). Ground every suggestion in the actual code shown — never invent code that isn't there.\n\n"
           + FRONTEND_DESIGN_PRACTICES;
       } else if (sourceCode) {
         systemPrompt =
-          "You are a staff engineer giving remediation guidance for one specific code file in an engineering-debt dashboard, and you have been given its real source code below the metrics. Use the metrics as signal for WHAT to focus on, and the real source for HOW to fix it. Structure your answer in markdown with these sections: '## What's driving the debt score' (2-3 sentences tying the score components to what you see in the actual code), '## SOLID / design-pattern / reusability critique' (call out specific violations you can see in the real code — SRP, OCP, duplicated logic, tight coupling — not generic principles), '## Recommended fixes' (a prioritized numbered list, most impactful first, each with a one-line why and, where it clarifies the fix, a short before/after fenced code block quoting the actual lines), and '## Quick win' (the single smallest change that would help soonest). End with a line of the exact form '**Confidence: High|Medium|Low** — <one short reason>'. Ground every suggestion in the actual code shown — never invent code that isn't there.";
+          "You are a staff engineer giving remediation guidance for one specific code file in an engineering-debt dashboard, and you have been given its real source code below the metrics. Use the metrics as signal for WHAT to focus on, and the real source for HOW to fix it. Structure your answer in markdown with these sections: '## What's driving the debt score' (2-3 sentences tying the score components to what you see in the actual code), '## SOLID / design-pattern / reusability critique' (call out specific violations you can see in the real code — SRP, OCP, duplicated logic, tight coupling — not generic principles), '## Recommended fixes' (a prioritized numbered list, most impactful first, each with a one-line why and, where it clarifies the fix, a short before/after fenced code block quoting the actual lines), and '## Quick win' (the single smallest change that would help soonest). Ground every suggestion in the actual code shown — never invent code that isn't there.";
       } else {
         systemPrompt =
-          "You are a staff engineer giving remediation guidance for one specific file or database table in an engineering-debt dashboard. Use ONLY the data given — never invent metrics. Structure your answer in markdown with these sections: '## What's driving the debt score' (2-3 sentences tying the score components to what you see), '## Recommended fixes' (a prioritized numbered list, most impactful first, each with a one-line why), and '## Quick win' (the single smallest change that would help soonest). End with a line of the exact form '**Confidence: High|Medium|Low** — <one short reason>' reflecting how directly the data supports these recommendations. Be concrete and specific to the actual metrics/issues listed, not generic advice.";
+          "You are a staff engineer giving remediation guidance for one specific file or database table in an engineering-debt dashboard. Use ONLY the data given — never invent metrics. Structure your answer in markdown with these sections: '## What's driving the debt score' (2-3 sentences tying the score components to what you see), '## Recommended fixes' (a prioritized numbered list, most impactful first, each with a one-line why), and '## Quick win' (the single smallest change that would help soonest). Be concrete and specific to the actual metrics/issues listed, not generic advice.";
       }
+      systemPrompt += "\n\n" + PER_ITEM_CONFIDENCE_INSTRUCTION;
+      if (kbSources.length) {
+        systemPrompt += "\n\nSome reference material is included below the metrics, each tagged [KB-<id>] — a mix of the team's own uploaded documents and this app's bundled industry-standard references on SOLID principles, design patterns, and microservices architecture best practices.";
+      }
+      systemPrompt += feedbackNote;
 
       const res = await fetch(CHAT_API_URL, {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          max_tokens: sourceCode ? 1500 : 900,
+          // Generous headroom: a "be thorough" system prompt plus a model that
+          // can spend some of this budget on internal reasoning before it
+          // writes visible text means a tight cap risks a truncated or even
+          // fully empty answer (all budget spent reasoning, none left to write).
+          // Per-item confidence/citation tags also add real length to a long
+          // "Recommended fixes" list — confirmed via direct testing that 8192
+          // still truncated a demanding answer before Claude accepted 16384
+          // with no complaint, so recommendations get real margin here too.
+          max_tokens: sourceCode ? 6000 : 4000,
           system: systemPrompt,
           messages: [{ role: "user", content: prompt }],
         }),
       });
       const json = await res.json();
       const text = (json.content || []).filter((b) => b.type === "text").map((b) => b.text).join("\n") || "No response.";
-      setRecommendation({ forId: node.id, loading: false, text, error: false });
+      // When the provider call itself failed (json.error), nothing was
+      // actually grounded in the retrieved sources — showing them next to an
+      // error message would look like citations for an answer that doesn't exist.
+      setRecommendation({ forId: node.id, loading: false, text, error: !!json.error, sources: json.error ? [] : kbSources, kbQuery });
     } catch (e) {
-      setRecommendation({ forId: node.id, loading: false, text: "Couldn't reach the guidance model.", error: true });
+      setRecommendation({ forId: node.id, loading: false, text: "Couldn't reach the guidance model.", error: true, sources: [], kbQuery: "" });
     }
+  }
+
+  async function voteOnRecommendation(dir) {
+    const nodeId = recommendation.forId;
+    if (!nodeId) return;
+    setRecVoted((v) => ({ ...v, [nodeId]: dir }));
+    try {
+      await fetch("/api/feedback", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ question: recommendation.kbQuery || nodeId, answer: recommendation.text, vote: dir, node_id: nodeId }),
+      });
+      if (dir === "down") {
+        fetch("/api/feedback/recent?vote=down&scope=recommendation&limit=5").then((r) => r.json()).then((d) => setRecentRecDownvotes(d.items || []));
+      }
+    } catch { /* feedback persistence is best-effort */ }
   }
 
   useEffect(() => {
@@ -547,17 +826,65 @@ function FullGraphTab({ nodesById, edges, data, focal, setFocal, filterKind, emp
     const simLinks = scopedEdges.filter((e) => nodeById[e.source] && nodeById[e.target]).map((e) => ({ ...e }));
     simNodesRef.current = simNodes;
 
+    // Tiered layout: columns (Frontend | Backend | Database, 2 columns if no
+    // DB was analyzed) instead of one free-floating blob — laneX below pins
+    // each node's x-force target to its tier's column center.
+    let activeTiers = null, laneX = null, laneStep = 0;
+    if (tiered) {
+      const present = new Set(simNodes.map((n) => classifyTier(n)));
+      activeTiers = TIER_ORDER.filter((t) => present.has(t));
+      const margin = 90;
+      laneStep = activeTiers.length > 1 ? (width - margin * 2) / (activeTiers.length - 1) : 0;
+      laneX = (tier) => (activeTiers.length > 1 ? margin + activeTiers.indexOf(tier) * laneStep : width / 2);
+
+      const bandWidth = activeTiers.length > 1 ? laneStep * 0.92 : width * 0.6;
+      zoomLayer.append("g").selectAll("rect.tier-band").data(activeTiers).join("rect")
+        .attr("x", (t) => laneX(t) - bandWidth / 2).attr("y", 8)
+        .attr("width", bandWidth).attr("height", height - 16).attr("rx", 10)
+        .attr("fill", (t) => TIER_BAND_FILLS[t] || "#F8FAFC");
+      zoomLayer.append("g").selectAll("text.tier-label").data(activeTiers).join("text")
+        .attr("x", (t) => laneX(t)).attr("y", 26).attr("text-anchor", "middle")
+        .attr("font-size", 11).attr("font-weight", 700).attr("letter-spacing", 0.6)
+        .attr("fill", "#93A7BF").text((t) => TIER_LABELS[t].toUpperCase());
+
+      // Chevrons in the gap between adjacent bands, reinforcing that this is
+      // a left-to-right request path, not just three unordered groups.
+      if (activeTiers.length > 1) {
+        const chevronYs = [height * 0.28, height * 0.5, height * 0.72];
+        const chevronData = [];
+        for (let i = 0; i < activeTiers.length - 1; i++) {
+          const cx = (laneX(activeTiers[i]) + bandWidth / 2 + laneX(activeTiers[i + 1]) - bandWidth / 2) / 2;
+          chevronYs.forEach((cy) => chevronData.push({ cx, cy }));
+        }
+        zoomLayer.append("g").selectAll("path.flow-chevron").data(chevronData).join("path")
+          .attr("d", "M -5,-7 L 6,0 L -5,7")
+          .attr("transform", (d) => `translate(${d.cx},${d.cy})`)
+          .attr("fill", "none").attr("stroke", "#C7D6E8").attr("stroke-width", 2.2)
+          .attr("stroke-linecap", "round").attr("stroke-linejoin", "round")
+          .attr("pointer-events", "none");
+      }
+    }
+
     const sim = d3.forceSimulation(simNodes)
       .force("link", d3.forceLink(simLinks).id((d) => d.id).distance(65).strength(0.22))
       .force("charge", d3.forceManyBody().strength(-130))
-      .force("center", d3.forceCenter(width / 2, height / 2))
       .force("collide", d3.forceCollide((d) => nodeRadius(d) + 8));
+    if (tiered) {
+      sim.force("x", d3.forceX((d) => laneX(classifyTier(d))).strength(0.35));
+      sim.force("y", d3.forceY(height / 2).strength(0.05));
+    } else {
+      sim.force("center", d3.forceCenter(width / 2, height / 2));
+    }
 
+    // Once forceLink resolves link.source/target from ids to node objects
+    // (synchronous, done by the .force("link", ...) call above), a tiered
+    // layout can tell a cross-tier edge — the actual flow of communication
+    // this view exists to surface — from the dense same-tier mesh around it.
     const linkSel = zoomLayer.append("g").selectAll("line").data(simLinks).join("line")
       .attr("stroke", (d) => edgeColor(d.edge_type))
-      .attr("stroke-width", 1.2)
+      .attr("stroke-width", (d) => baseEdgeWidth(d, tiered))
       .attr("stroke-dasharray", (d) => (d.edge_type === "code_to_table" ? "3,3" : null))
-      .attr("opacity", 0.45)
+      .attr("opacity", (d) => baseEdgeOpacity(d, tiered))
       .attr("marker-end", "url(#arrow)");
     linkSelRef.current = linkSel;
 
@@ -587,14 +914,17 @@ function FullGraphTab({ nodesById, edges, data, focal, setFocal, filterKind, emp
     nodeSel.on("click", (event, d) => { event.stopPropagation(); setFocal(d.id); });
     svg.on("click", () => setFocal(null));
 
-    nodeSel.call(
-      d3.drag()
-        .on("start", (event, d) => { if (!event.active) sim.alphaTarget(0.25).restart(); d.fx = d.x; d.fy = d.y; })
-        .on("drag", (event, d) => { d.fx = event.x; d.fy = event.y; })
-        .on("end", (event, d) => { if (!event.active) sim.alphaTarget(0); d.fx = null; d.fy = null; })
-    );
-
-    const zoom = d3.zoom().scaleExtent([0.35, 4]).on("zoom", (event) => zoomLayer.attr("transform", event.transform));
+    // Deliberately no per-node drag: it used to compete with canvas panning
+    // for the same pointer gesture, and since nodes are large and densely
+    // packed, almost every attempted "drag to pan" actually grabbed a node
+    // instead — snapping it (and, via the collide/link forces, its
+    // neighbors) into a chaotic new position instead of moving the camera,
+    // which is exactly what a map-style zoom/pan should never do. The
+    // repositioning it enabled wasn't even persistent (a released node
+    // drifted back under the tier/link/collide forces within a tick or
+    // two), so removing it costs nothing and makes every drag anywhere on
+    // the canvas — including on top of a node — reliably pan instead.
+    const zoom = d3.zoom().scaleExtent([0.35, 8]).on("zoom", (event) => zoomLayer.attr("transform", event.transform));
     svg.call(zoom);
     zoomRef.current = { zoom, svg, width, height };
 
@@ -605,7 +935,7 @@ function FullGraphTab({ nodesById, edges, data, focal, setFocal, filterKind, emp
 
     nodeSelRef.current = nodeSel;
     return () => sim.stop();
-  }, [nodes, scopedEdges, setFocal]);
+  }, [nodes, scopedEdges, setFocal, tiered]);
 
   // Recolor without rebuilding the layout when the "color by" mode changes.
   useEffect(() => {
@@ -620,7 +950,7 @@ function FullGraphTab({ nodesById, edges, data, focal, setFocal, filterKind, emp
     if (!nodeSel || !linkSel) return;
     if (!focal) {
       nodeSel.attr("opacity", 1);
-      linkSel.attr("opacity", 0.45).attr("stroke-width", 1.2);
+      linkSel.attr("opacity", (d) => baseEdgeOpacity(d, tiered)).attr("stroke-width", (d) => baseEdgeWidth(d, tiered));
       nodeSel.select("rect, circle").attr("stroke-width", 1.8);
       return;
     }
@@ -634,7 +964,7 @@ function FullGraphTab({ nodesById, edges, data, focal, setFocal, filterKind, emp
     linkSel
       .attr("opacity", (d) => (d.source.id === focal || d.target.id === focal ? 0.9 : 0.18))
       .attr("stroke-width", (d) => (d.source.id === focal || d.target.id === focal ? 2 : 1.2));
-  }, [focal, scopedEdges]);
+  }, [focal, scopedEdges, tiered]);
 
   useEffect(() => { setRecommendation({ forId: null, loading: false, text: "", error: false }); }, [focal]);
 
@@ -692,6 +1022,77 @@ function FullGraphTab({ nodesById, edges, data, focal, setFocal, filterKind, emp
         </div>
       </div>
 
+      {tiered && (
+        <div style={{ display: "flex", alignItems: "flex-start", gap: 8, marginBottom: 10, padding: "9px 12px", background: "#F8FBFF", border: "1px solid #E1EBF5", borderRadius: 10 }}>
+          <Workflow size={15} style={{ flexShrink: 0, marginTop: 1, color: "#0369A1" }} />
+          <div style={{ fontSize: 11.5, color: "#3A4E68", lineHeight: 1.55 }}>
+            <strong style={{ color: "#0F2540" }}>How to read this: </strong>
+            nodes are placed along the request path your code actually follows — <strong>Frontend</strong> (user-facing / entry code) → <strong>Backend</strong> (business logic) → <strong>Database</strong> — so debt concentration is visible stage by stage, not just file by file. Bright, thicker edges cross a tier boundary — real inter-layer coupling; faint edges stay inside one tier and are dimmed on purpose so they don't drown out the flow. Start with whichever tier below carries the highest average debt, then click a node for its details or an AI-grounded fix.
+          </div>
+        </div>
+      )}
+
+      {tierSummary && (
+        <div style={{ display: "flex", alignItems: "stretch", marginBottom: 10 }}>
+          {tierSummary.map((t, i) => (
+            <React.Fragment key={t.tier}>
+              <div style={{ flex: 1, minWidth: 150, background: "#FFFFFF", border: "1px solid #E1EBF5", borderRadius: 10, padding: "10px 14px" }}>
+                <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 7 }}>
+                  <span style={{ fontSize: 12.5, fontWeight: 700, color: "#0F2540" }}>{TIER_LABELS[t.tier]}</span>
+                  <span style={{ fontSize: 10.5, color: "#93A7BF" }}>{t.count} item{t.count === 1 ? "" : "s"}</span>
+                </div>
+                <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                  <div style={{ flex: 1, height: 9, borderRadius: 5, background: "#EEF3F8", overflow: "hidden" }}>
+                    <div style={{ width: `${Math.max(4, Math.round((t.avgDebt ?? 0) * 100))}%`, height: "100%", borderRadius: 5, background: t.avgDebt == null ? "#CBD5E1" : debtColor(t.avgDebt) }} />
+                  </div>
+                  <span style={{ fontSize: 13.5, fontWeight: 700, color: t.avgDebt == null ? "#93A7BF" : debtColor(t.avgDebt), minWidth: 32, textAlign: "right" }}>
+                    {t.avgDebt == null ? "—" : t.avgDebt.toFixed(2)}
+                  </span>
+                </div>
+                <div style={{ fontSize: 10, color: "#93A7BF", marginTop: 4, display: "flex", alignItems: "center" }}>
+                  avg debt score <InfoIcon text={TIER_SCORE_INFO[t.tier]} size={11} />
+                </div>
+              </div>
+              {i < tierSummary.length - 1 && (
+                <div style={{ display: "flex", alignItems: "center", padding: "0 8px", color: "#B7CDE3" }}>
+                  <ArrowRight size={20} />
+                </div>
+              )}
+            </React.Fragment>
+          ))}
+        </div>
+      )}
+
+      {repoDbLinks && (
+        <div style={{ marginBottom: 10, padding: "10px 12px", background: "#FBFDFF", border: "1px solid #E1EBF5", borderRadius: 10 }}>
+          <div style={{ fontSize: 11.5, fontWeight: 700, color: "#0F2540", marginBottom: 2 }}>Which repo talks to which database</div>
+          <div style={{ fontSize: 10.5, color: "#93A7BF", marginBottom: 8 }}>Detected automatically from code-to-table references found during analysis — a count of real matches, not a guess.</div>
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
+            {repoDbLinks.perRepo.map(({ repo, links }) => (
+              <div key={repo.slug} style={{ display: "flex", alignItems: "center", gap: 6, background: "#FFFFFF", border: "1px solid #E1EBF5", borderRadius: 9, padding: "6px 10px", fontSize: 11.5 }}>
+                <GitBranch size={12} color="#5B7290" />
+                <strong style={{ color: "#0F2540" }}>{repo.name}</strong>
+                {links.length === 0 ? (
+                  <span style={{ color: "#B45309" }}>→ no database reference detected</span>
+                ) : (
+                  <>
+                    <ArrowRight size={12} color="#93A7BF" />
+                    <span style={{ color: "#5B7290" }}>
+                      {links.map((l) => `${l.name} (${l.tableCount} table${l.tableCount === 1 ? "" : "s"})`).join(", ")}
+                    </span>
+                  </>
+                )}
+              </div>
+            ))}
+            {repoDbLinks.orphanDbs.map((d) => (
+              <div key={d.slug} style={{ display: "flex", alignItems: "center", gap: 6, background: "#FDECEC", border: "1px solid #F5C6C6", borderRadius: 9, padding: "6px 10px", fontSize: 11.5, color: "#9F1D1D" }}>
+                <Database size={12} /> {d.name}: not referenced by any analyzed repo
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
       <div style={{ position: "relative", flex: 1, background: "#FFFFFF", border: "1px solid #E1EBF5", borderRadius: 12, minHeight: 420, overflow: "hidden" }}>
         <svg ref={svgRef} width="100%" height="100%" style={{ display: "block" }} />
 
@@ -726,24 +1127,42 @@ function FullGraphTab({ nodesById, edges, data, focal, setFocal, filterKind, emp
           <div style={{ position: "absolute", top: 14, left: 14, width: 340, maxHeight: "calc(100% - 60px)", overflowY: "auto", background: "#FFFFFF", border: "1px solid #E1EBF5", borderRadius: 10, padding: 16, boxShadow: "0 12px 32px rgba(15,37,64,0.16)" }}>
             <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 8 }}>
               <div style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, fontWeight: 700, color: "#0369A1" }}><Sparkles size={13} /> Recommendations for {shortName(focal)}</div>
-              <button onClick={() => setRecommendation({ forId: null, loading: false, text: "", error: false })} style={{ background: "none", border: "none", cursor: "pointer", color: "#93A7BF" }}><X size={14} /></button>
+              <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                {!recommendation.loading && !recommendation.error && (
+                  <div style={{ display: "flex", gap: 2 }}>
+                    <button onClick={() => voteOnRecommendation("up")} title="Helpful recommendation"
+                      style={{ background: "none", border: "none", cursor: "pointer", padding: 3, color: recVoted[focal] === "up" ? "#0EA5E9" : "#B7C4D6" }}>
+                      <ThumbsUp size={13} />
+                    </button>
+                    <button onClick={() => voteOnRecommendation("down")} title="Not helpful"
+                      style={{ background: "none", border: "none", cursor: "pointer", padding: 3, color: recVoted[focal] === "down" ? "#DC2626" : "#B7C4D6" }}>
+                      <ThumbsDown size={13} />
+                    </button>
+                  </div>
+                )}
+                <button onClick={() => setRecommendation({ forId: null, loading: false, text: "", error: false, sources: [], kbQuery: "" })} style={{ background: "none", border: "none", cursor: "pointer", color: "#93A7BF" }}><X size={14} /></button>
+              </div>
             </div>
             {recommendation.loading ? (
               <div style={{ fontSize: 12.5, color: "#93A7BF" }}>Thinking through the metrics…</div>
             ) : (
-              <AnswerBlock text={recommendation.text} error={recommendation.error} />
+              <>
+                <AnswerBlock text={recommendation.text} error={recommendation.error} />
+                <KnowledgeSourcesPanel sources={recommendation.sources} query={recommendation.kbQuery} />
+              </>
             )}
           </div>
         )}
 
-        <div style={{ position: "absolute", bottom: 10, left: 12, display: "flex", gap: 14, fontSize: 10.5, color: "#7B8FA8", background: "rgba(255,255,255,0.9)", padding: "5px 10px", borderRadius: 8 }}>
+        <div style={{ position: "absolute", bottom: 10, left: 12, display: "flex", gap: 14, fontSize: 10.5, color: "#7B8FA8", background: "rgba(255,255,255,0.9)", padding: "5px 10px", borderRadius: 8, flexWrap: "wrap", maxWidth: "calc(100% - 24px)" }}>
           <span>● circle = file</span>
           <span>▪ square = table</span>
           <span style={{ color: "#6366F1" }}>— foreign key</span>
           <span style={{ color: "#F59E0B" }}>┄ code → table</span>
+          {tiered && <span>bright/thick edge = crosses a tier · faint edge = stays within one</span>}
         </div>
       </div>
-      <p style={{ fontSize: 12, color: "#93A7BF", marginTop: 8 }}>Drag nodes to rearrange, scroll to zoom, click a node to focus it — click empty space to clear.</p>
+      <p style={{ fontSize: 12, color: "#93A7BF", marginTop: 8 }}>Scroll or pinch to zoom in on any point, drag anywhere to pan — click a node to focus it, click empty space to clear.</p>
     </div>
   );
 }
@@ -860,10 +1279,14 @@ function ConfidenceBadge({ level, reason }) {
   );
 }
 
-// The model self-reports a High/Medium/Low confidence line at the end of
-// each answer (requested in the system prompt) — we parse it out and show
-// it as a badge rather than leaving it buried in the prose. This is a
-// verbalized, model-reported signal, not a computed statistical probability.
+// The system prompt now asks for a High/Medium/Low confidence tag inline on
+// each individual fix/finding (see PER_ITEM_CONFIDENCE_INSTRUCTION) so it
+// stays traceable to the specific claim it covers, rather than one blanket
+// tag for a whole multi-item answer — those render naturally as part of the
+// markdown body below, no extraction needed. parseConfidence only still
+// matches the older single-trailing-line form, for the rare short answer
+// that makes just one claim and never adopted the per-item shape; when it
+// doesn't match (the common case now), this simply renders the body as-is.
 function AnswerBlock({ text, error }) {
   if (error) return <div style={{ fontSize: 13, color: "#9F1D1D" }}>{text}</div>;
   const { body, confidence, reason } = parseConfidence(text);
@@ -905,24 +1328,45 @@ function ChatTab({ data }) {
       const feedbackNote = recentDownvotes.length
         ? `\n\nThe team has previously down-voted these answers as unhelpful — avoid repeating the same mistakes (vague claims, missing specifics, ignoring a relevant metric):\n${recentDownvotes.map((f, i) => `${i + 1}. Q: "${f.question}" — the down-voted answer was: "${f.answer.slice(0, 200)}..."`).join("\n")}`
         : "";
+
+      const kbSources = await searchKnowledgeBase(text);
+      const kbSection = kbSources.length
+        ? `\n\nReference material retrieved from the team's knowledge base (cite by its [KB-...] tag when you use it — don't invent a citation for anything not listed here):\n${kbSources.map((s) => `[KB-${s.chunk_id}] ${s.filename}${s.page ? ` (p.${s.page})` : ""}: ${s.text}`).join("\n\n")}`
+        : "";
+      const kbInstruction = kbSources.length
+        ? "\n\nReference material relevant to this question is included below, each tagged [KB-<id>]."
+        : "";
+
       const res = await fetch(CHAT_API_URL, {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          max_tokens: 1400,
+          // Same headroom reasoning as getRecommendations(): this system prompt
+          // explicitly asks for a thorough, multi-section answer, and a tight
+          // cap risks the model spending its whole budget on internal
+          // reasoning before writing any visible text at all. A demanding ask
+          // (e.g. a "top 10 fixes" breakdown with a per-item confidence tag
+          // and citation on each one) can genuinely need this much — confirmed
+          // via direct testing that 8192 still truncated a real "top 10 fixes"
+          // answer before any items were written, while both Claude and
+          // Gemini accepted 16384 without complaint and completed cleanly.
+          max_tokens: 16384,
           system: `You are the guidance layer of an engineering-debt dashboard for an engineering team. Answer ONLY using the metrics data below — never invent numbers, files, or tables that aren't listed, and never fabricate a business-impact estimate (dollars, hours saved, risk %) that isn't derivable from the data. Reference specific paths/tables and their actual values, including which score component (complexity/churn/security/design, or performance/security/design for tables) is driving the concern.
 
-Format every answer in markdown with clear sections appropriate to the question — typically a short summary line, then '## '-headed sections such as findings, root causes, and recommendations, using bullet or numbered lists for anything enumerable and a table when comparing several files/tables side by side. Be thorough and specific rather than terse: this is a working reference the team will read carefully, not a one-line reply. Still avoid padding — every sentence should carry real information from the data.
+Format every answer in markdown with clear sections appropriate to the question — typically a short summary line, then '## '-headed sections such as findings, root causes, and recommendations. Be thorough and specific rather than terse: this is a working reference the team will read carefully, not a one-line reply. Still avoid padding — every sentence should carry real information from the data.
 
-End every answer with a line of the exact form '**Confidence: High|Medium|Low** — <one short reason>', reflecting how directly the specific data you were given supports the claims you made (High = every claim traces to a specific number in the data; Low = you had to infer or generalize beyond what's listed).${feedbackNote}\n\n${context}`,
+${PER_ITEM_CONFIDENCE_INSTRUCTION}${feedbackNote}${kbInstruction}\n\n${context}${kbSection}`,
           messages: [...messages, userMsg].map((m) => ({ role: m.role, content: m.content })),
         }),
       });
       const json = await res.json();
       const textOut = (json.content || []).filter((b) => b.type === "text").map((b) => b.text).join("\n") || "No response.";
       const mentioned = [...data.files, ...(data.tables || [])].filter((f) => textOut.includes(shortName(f.file))).length;
-      setMessages((m) => [...m, { role: "assistant", content: textOut, question: text, matched: mentioned, id: Date.now() }]);
+      // When the provider call itself failed (json.error), nothing was
+      // actually grounded in the retrieved sources — showing them next to an
+      // error message would look like citations for an answer that doesn't exist.
+      setMessages((m) => [...m, { role: "assistant", content: textOut, question: text, matched: mentioned, id: Date.now(), error: !!json.error, sources: json.error ? [] : kbSources, kbQuery: text }]);
     } catch (e) {
-      setMessages((m) => [...m, { role: "assistant", content: "Couldn't reach the guidance model — check Admin settings for a valid API key.", error: true, id: Date.now() }]);
+      setMessages((m) => [...m, { role: "assistant", content: "Couldn't reach the guidance model — check Admin settings for a valid API key.", error: true, id: Date.now(), sources: [] }]);
     }
     setLoading(false);
   }
@@ -962,6 +1406,7 @@ End every answer with a line of the exact form '**Confidence: High|Medium|Low** 
             ) : (
               <div style={{ padding: "12px 16px", borderRadius: 12, background: m.error ? "#FDECEC" : "#F3F8FD", color: "#0F2540" }}>
                 <AnswerBlock text={m.content} error={m.error} />
+                <KnowledgeSourcesPanel sources={m.sources} query={m.kbQuery} />
               </div>
             )}
             {m.role === "assistant" && !m.error && (
@@ -991,7 +1436,7 @@ End every answer with a line of the exact form '**Confidence: High|Medium|Low** 
 // ---------------------------------------------------------------------------
 // Shell
 // ---------------------------------------------------------------------------
-export default function Dashboard({ data, onReanalyze }) {
+export default function Dashboard({ data, onReanalyze, jobRunning, jobStep, jobError, justCompleted, onDismissComplete, onDismissError }) {
   const hasDb = data.has_db && data.tables && data.tables.length > 0;
   const [tab, setTab] = useState("heat");
   const [selectedFile, setSelectedFile] = useState(null);
@@ -1009,19 +1454,36 @@ export default function Dashboard({ data, onReanalyze }) {
     return m;
   }, [data]);
 
-  const goToDeps = (id) => { setFocal(id); setTab("deps"); };
+  const goToDeps = (id) => { setFocal(id); setTab("flow"); };
 
   const NAV = [
     { id: "heat", label: "Code heatmap", icon: Flame },
     { id: "db", label: "DB heatmap", icon: Database },
-    { id: "deps", label: "Combined dependencies", icon: GitBranch },
-    ...(hasDb ? [{ id: "dbdeps", label: "DB dependencies", icon: Database }] : []),
+    { id: "flow", label: "Dependency flow", icon: Workflow },
     { id: "chat", label: "Ask", icon: MessageCircle },
   ];
 
   return (
     <div style={{ fontFamily: "Inter, system-ui, sans-serif", background: "#F5F9FD", minHeight: "100vh", color: "#0F2540", display: "flex", flexDirection: "column" }}>
       {showAdmin && <AdminPanel onClose={() => setShowAdmin(false)} />}
+      {jobRunning && (
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 8, padding: "8px 16px", background: "#E7F4FE", color: "#0369A1", fontSize: 12.5, fontWeight: 600 }}>
+          <Loader2 size={13} className="spin-dashboard" /> Analyzing in the background ({STEP_LABELS[jobStep] || "working…"}) — the dashboard below stays interactive with the last completed results; it'll refresh automatically when this finishes.
+        </div>
+      )}
+      {justCompleted && (
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 10, padding: "8px 16px", background: "#E7F9F1", color: "#0F7B4E", fontSize: 12.5, fontWeight: 600 }}>
+          <Check size={13} /> Analysis complete — showing the latest results.
+          <button onClick={onDismissComplete} style={{ background: "none", border: "none", cursor: "pointer", color: "#0F7B4E", padding: 0, textDecoration: "underline", fontSize: 12.5, fontWeight: 600 }}>Dismiss</button>
+        </div>
+      )}
+      {jobError && (
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 10, padding: "8px 16px", background: "#FDECEC", color: "#9F1D1D", fontSize: 12.5, fontWeight: 600 }}>
+          <AlertTriangle size={13} /> Background analysis failed: {jobError}
+          <button onClick={onDismissError} style={{ background: "none", border: "none", cursor: "pointer", color: "#9F1D1D", padding: 0, textDecoration: "underline", fontSize: 12.5, fontWeight: 600 }}>Dismiss</button>
+        </div>
+      )}
+      <style>{`.spin-dashboard { animation: spinDashboard 1s linear infinite; display: inline-block; } @keyframes spinDashboard { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }`}</style>
       <header style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "16px 22px", borderBottom: "1px solid #E1EBF5", background: "#FFFFFF", flexWrap: "wrap", gap: 10 }}>
         <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
           <div style={{ width: 30, height: 30, borderRadius: 8, background: "#0EA5E9", display: "flex", alignItems: "center", justifyContent: "center" }}><Flame size={16} color="white" /></div>
@@ -1050,7 +1512,8 @@ export default function Dashboard({ data, onReanalyze }) {
             style={{ display: "flex", alignItems: "center", gap: 5, fontSize: 12, fontWeight: 600, color: "#5B7290", background: "#F3F8FD", border: "1px solid #E1EBF5", borderRadius: 8, padding: "7px 10px", cursor: "pointer" }}>
             <Settings size={13} />
           </button>
-          <button onClick={onReanalyze} style={{ display: "flex", alignItems: "center", gap: 5, fontSize: 12, fontWeight: 600, color: "#0369A1", background: "#E7F4FE", border: "none", borderRadius: 8, padding: "7px 12px", cursor: "pointer" }}>
+          <button onClick={onReanalyze} disabled={jobRunning} title={jobRunning ? "An analysis is already running in the background" : undefined}
+            style={{ display: "flex", alignItems: "center", gap: 5, fontSize: 12, fontWeight: 600, color: jobRunning ? "#93A7BF" : "#0369A1", background: jobRunning ? "#F3F8FD" : "#E7F4FE", border: "none", borderRadius: 8, padding: "7px 12px", cursor: jobRunning ? "default" : "pointer" }}>
             <RefreshCw size={12} /> New analysis
           </button>
         </div>
@@ -1095,12 +1558,7 @@ export default function Dashboard({ data, onReanalyze }) {
               />
             ) : <NoDbNotice onReanalyze={onReanalyze} />
           )}
-          {tab === "deps" && <FullGraphTab nodesById={nodesById} edges={data.edges} data={data} focal={focal} setFocal={setFocal} emptyLabel="No dependency data yet." />}
-          {tab === "dbdeps" && (
-            hasDb ? (
-              <FullGraphTab nodesById={nodesById} edges={data.edges} data={data} focal={focal} setFocal={setFocal} filterKind="table" emptyLabel="No database tables to show." />
-            ) : <NoDbNotice onReanalyze={onReanalyze} />
-          )}
+          {tab === "flow" && <FullGraphTab nodesById={nodesById} edges={data.edges} data={data} focal={focal} setFocal={setFocal} tiered emptyLabel="No dependency data yet." />}
           {tab === "chat" && <ChatTab data={data} />}
         </main>
       </div>

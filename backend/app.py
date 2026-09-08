@@ -16,6 +16,7 @@ import subprocess
 import tempfile
 import threading
 import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -24,7 +25,7 @@ from pathlib import Path
 # without editing the file again later.
 HARDCODED_ANTHROPIC_API_KEY = "sk-ant-REPLACE-WITH-YOUR-KEY"
 
-from fastapi import FastAPI
+from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
@@ -33,6 +34,7 @@ from pydantic import BaseModel
 import code_analyzers
 import db_analyzers
 import external_context
+import knowledge_base
 import llm_providers
 import multi_source
 
@@ -64,6 +66,12 @@ def init_app_db():
 
 
 init_app_db()
+
+# Ingests the bundled SOLID/design-pattern/microservices reference docs into
+# the knowledge base on first run (idempotent, see ensure_builtin_seed_documents).
+# Backgrounded because the first-ever call also lazily loads the local
+# embedding model, which shouldn't block server boot.
+threading.Thread(target=knowledge_base.ensure_builtin_seed_documents, daemon=True).start()
 
 
 def get_setting(key, default=None):
@@ -331,6 +339,60 @@ def file_source(id: str):
     return {"ok": True, "source": text[:FILE_SOURCE_MAX_CHARS], "truncated": len(text) > FILE_SOURCE_MAX_CHARS}
 
 
+def _ingest_document_job(path, filename):
+    try:
+        knowledge_base.ingest_document(path, filename)
+    except Exception:
+        pass  # ingest_document already records its own error onto the document row
+
+
+@app.post("/api/knowledge/upload")
+async def knowledge_upload(file: UploadFile = File(...)):
+    doc_id = uuid.uuid4().hex[:12]
+    safe_name = os.path.basename(file.filename or "document")
+    dest = knowledge_base.KNOWLEDGE_DIR / f"{doc_id}__{safe_name}"
+    with open(dest, "wb") as fh:
+        fh.write(await file.read())
+    t = threading.Thread(target=_ingest_document_job, args=(str(dest), safe_name), daemon=True)
+    t.start()
+    return {"ok": True, "filename": safe_name}
+
+
+@app.get("/api/knowledge/documents")
+def knowledge_documents():
+    return {"documents": knowledge_base.list_documents()}
+
+
+@app.delete("/api/knowledge/documents/{doc_id}")
+def knowledge_delete_document(doc_id: str):
+    deleted = knowledge_base.delete_document(doc_id)
+    if not deleted:
+        raise HTTPException(status_code=400, detail="This is a built-in reference document and can't be deleted.")
+    return {"ok": True}
+
+
+class KnowledgeSearchRequest(BaseModel):
+    query: str
+    top_k: int = 5
+
+
+@app.post("/api/knowledge/search")
+def knowledge_search(req: KnowledgeSearchRequest):
+    return {"results": knowledge_base.search(req.query, top_k=req.top_k)}
+
+
+class KnowledgeFeedbackRequest(BaseModel):
+    chunk_id: str
+    vote: str          # "up" | "down"
+    query: str | None = None
+
+
+@app.post("/api/knowledge/feedback")
+def knowledge_feedback(req: KnowledgeFeedbackRequest):
+    knowledge_base.record_feedback(req.chunk_id, req.vote, req.query)
+    return {"ok": True}
+
+
 class ChatRequest(BaseModel):
     system: str
     messages: list
@@ -344,8 +406,9 @@ def chat(req: ChatRequest):
     api_key = get_setting(f"{provider}_api_key")
     if not api_key and provider == "anthropic":
         api_key = os.environ.get("ANTHROPIC_API_KEY") or HARDCODED_ANTHROPIC_API_KEY
+    base_url = get_setting("ollama_base_url", llm_providers.DEFAULT_OLLAMA_BASE_URL) if provider == "ollama" else None
     try:
-        text = llm_providers.call_llm(provider, model, api_key, req.system, req.messages, req.max_tokens)
+        text = llm_providers.call_llm(provider, model, api_key, req.system, req.messages, req.max_tokens, base_url=base_url)
         return {"content": [{"type": "text", "text": text}]}
     except Exception as e:
         return {"content": [{"type": "text", "text": f"[{provider} error] {e}"}], "error": True}
@@ -355,10 +418,11 @@ class SettingsRequest(BaseModel):
     active_provider: str | None = None
     anthropic_model: str | None = None
     gemini_model: str | None = None
-    sarvam_model: str | None = None
+    ollama_model: str | None = None
     anthropic_api_key: str | None = None   # empty string / None = leave unchanged
     gemini_api_key: str | None = None
-    sarvam_api_key: str | None = None
+    ollama_api_key: str | None = None      # never required — Ollama ignores it
+    ollama_base_url: str | None = None
     atlassian_email: str | None = None            # Jira + Confluence Cloud share one credential pair
     atlassian_api_token: str | None = None
 
@@ -375,13 +439,17 @@ def get_settings():
     for p, meta in llm_providers.PROVIDERS.items():
         stored_key = get_setting(f"{p}_api_key", "")
         env_fallback = os.environ.get("ANTHROPIC_API_KEY") if p == "anthropic" else None
-        has_key = bool(stored_key) or bool(env_fallback) or (p == "anthropic" and HARDCODED_ANTHROPIC_API_KEY.startswith("sk-ant-") and "REPLACE" not in HARDCODED_ANTHROPIC_API_KEY)
+        # Ollama runs locally and never needs a key — always "ready" so its
+        # card doesn't show a misleading "no key yet" warning.
+        has_key = p == "ollama" or bool(stored_key) or bool(env_fallback) or (p == "anthropic" and HARDCODED_ANTHROPIC_API_KEY.startswith("sk-ant-") and "REPLACE" not in HARDCODED_ANTHROPIC_API_KEY)
         out["providers"][p] = {
             "label": meta["label"],
             "model": get_setting(f"{p}_model", meta["default_model"]),
             "has_key": has_key,
             "key_preview": _mask(stored_key),
         }
+        if p == "ollama":
+            out["providers"][p]["base_url"] = get_setting("ollama_base_url", llm_providers.DEFAULT_OLLAMA_BASE_URL)
     stored_email = get_setting("atlassian_email", "")
     stored_token = get_setting("atlassian_api_token", "")
     out["atlassian"] = {
@@ -396,13 +464,15 @@ def get_settings():
 def save_settings(req: SettingsRequest):
     if req.active_provider:
         set_setting("active_provider", req.active_provider)
-    for provider in ("anthropic", "gemini", "sarvam"):
+    for provider in ("anthropic", "gemini", "ollama"):
         model = getattr(req, f"{provider}_model")
         if model:
             set_setting(f"{provider}_model", model)
         key = getattr(req, f"{provider}_api_key")
         if key:  # only overwrite if the user actually typed something
             set_setting(f"{provider}_api_key", key)
+    if req.ollama_base_url:
+        set_setting("ollama_base_url", req.ollama_base_url)
     if req.atlassian_email is not None:
         set_setting("atlassian_email", req.atlassian_email)
     if req.atlassian_api_token:  # only overwrite if the user actually typed something
@@ -430,10 +500,16 @@ def submit_feedback(req: FeedbackRequest):
 
 
 @app.get("/api/feedback/recent")
-def recent_feedback(vote: str = "down", limit: int = 5):
+def recent_feedback(vote: str = "down", limit: int = 5, scope: str = "chat"):
+    # "chat" (Ask tab answers, node_id is never set) and "recommendation"
+    # (per-file/table recommendations, node_id is always set) are kept as
+    # separate in-context conditioning loops since they answer structurally
+    # different questions — a down-voted chat answer isn't a useful example
+    # of what to avoid in a file recommendation, and vice versa.
+    node_id_clause = "node_id IS NOT NULL" if scope == "recommendation" else "node_id IS NULL"
     conn = sqlite3.connect(APP_DB_PATH)
     rows = conn.execute(
-        "SELECT question, answer, created_at FROM chat_feedback WHERE vote = ? ORDER BY id DESC LIMIT ?",
+        f"SELECT question, answer, created_at FROM chat_feedback WHERE vote = ? AND {node_id_clause} ORDER BY id DESC LIMIT ?",
         (vote, limit),
     ).fetchall()
     conn.close()

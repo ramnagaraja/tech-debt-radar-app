@@ -4,7 +4,7 @@ import {
   Plus, X, BookOpen, ClipboardList,
 } from "lucide-react";
 
-const STEP_LABELS = {
+export const STEP_LABELS = {
   "resolving repositories": "Getting your code",
   "analyzing code (complexity, churn, imports, duplication)": "Analyzing code",
   "introspecting databases": "Reading your databases",
@@ -29,19 +29,25 @@ const emptyRepo = () => ({ source: "local", value: "", name: "", code_lang: "aut
 const emptyDb = () => ({ source: "connection_string", value: "", name: "", dialect: "auto" });
 const emptyContext = () => ({ kind: "jira", url: "" });
 
-export default function SetupScreen({ onReady }) {
+export default function SetupScreen({ onStarted }) {
   const [repos, repoOps] = useEntryList([{ ...emptyRepo(), _id: newId() }]);
   const [databases, dbOps] = useEntryList([]);
   const [contextSources, contextOps] = useEntryList([]);
-  const [status, setStatus] = useState(null); // null | "running" | "error"
-  const [step, setStep] = useState("");
+  const [starting, setStarting] = useState(false);
   const [error, setError] = useState(null);
 
-  const canSubmit = repos.length > 0 && repos.every((r) => r.value.trim().length > 0) && status !== "running";
+  const canSubmit = repos.length > 0 && repos.every((r) => r.value.trim().length > 0) && !starting;
 
   async function submit() {
-    setStatus("running");
+    setStarting(true);
     setError(null);
+    // Requesting Notification permission here (not later) matters: browsers
+    // only honor this prompt off a real user gesture, and clicking "Run
+    // analysis" is the last such gesture before the run becomes a background
+    // thread the user may not be watching a UI for.
+    if (typeof Notification !== "undefined" && Notification.permission === "default") {
+      Notification.requestPermission().catch(() => {});
+    }
     try {
       const resp = await fetch("/api/analyze", {
         method: "POST",
@@ -58,29 +64,11 @@ export default function SetupScreen({ onReady }) {
       });
       const json = await resp.json();
       if (!json.ok) throw new Error(json.message || "Could not start analysis.");
-      poll();
+      onStarted();
     } catch (e) {
-      setStatus("error");
+      setStarting(false);
       setError(e.message);
     }
-  }
-
-  function poll() {
-    const interval = setInterval(async () => {
-      const resp = await fetch("/api/status");
-      const s = await resp.json();
-      setStep(s.step);
-      if (s.status === "done") {
-        clearInterval(interval);
-        const metricsResp = await fetch("/api/metrics");
-        const data = await metricsResp.json();
-        onReady(data);
-      } else if (s.status === "error") {
-        clearInterval(interval);
-        setStatus("error");
-        setError(s.error);
-      }
-    }, 1200);
   }
 
   return (
@@ -226,9 +214,9 @@ export default function SetupScreen({ onReady }) {
           <AddButton label="Add a Jira or Confluence link" onClick={() => contextOps.add(emptyContext())} />
         </Field>
 
-        {status === "error" && (
+        {error && (
           <div style={{ background: "#FDECEC", color: "#B91C1C", padding: "10px 12px", borderRadius: 8, fontSize: 12.5, marginBottom: 16 }}>
-            {error || "Something went wrong."}
+            {error}
           </div>
         )}
 
@@ -240,8 +228,8 @@ export default function SetupScreen({ onReady }) {
             background: canSubmit ? "#0EA5E9" : "#CFE4F5", color: "white",
           }}
         >
-          {status === "running" ? (
-            <><Loader2 size={16} className="spin" /> {STEP_LABELS[step] || "Working…"}</>
+          {starting ? (
+            <><Loader2 size={16} className="spin" /> Starting…</>
           ) : (
             <><Play size={15} /> Run analysis</>
           )}

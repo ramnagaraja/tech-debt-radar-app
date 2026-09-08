@@ -110,7 +110,11 @@ def analyze_databases(db_specs):
         id_map = {t["file"]: prefix + t["file"] for t in result["tables"]}
         for t in result["tables"]:
             row = dict(t)
-            row["bare_name"] = t["file"]  # pre-namespace name — code references the bare table name, not "db.table"
+            # pre-namespace/pre-schema name — code references the bare table name,
+            # not "db.table" or (for a live DB whose tables span more than one
+            # schema) "schema.table". live.py sets bare_name explicitly when it
+            # had to schema-qualify "file"; sql_file.py's "file" is always bare.
+            row["bare_name"] = t.get("bare_name", t["file"])
             row["id"] = id_map[t["file"]]
             row["file"] = id_map[t["file"]]
             row["db"] = slug

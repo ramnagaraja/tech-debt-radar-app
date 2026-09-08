@@ -10,3 +10,8 @@ sqlalchemy
 pymysql
 pyodbc
 sqlglot
+fastembed
+pypdf
+python-docx
+numpy
+python-multipart

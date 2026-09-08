@@ -1,0 +1,19 @@
+Secure Coding Standard: SQL Injection Prevention
+
+All database queries must use parameterized statements or an ORM query
+builder. Never concatenate untrusted user input directly into a SQL
+string. When building dynamic queries, use bound parameters exclusively.
+
+Code review checklist for SQL injection:
+- Reject any pull request that builds a SQL string via string
+  concatenation or f-strings with user-controlled values.
+- Prefer stored procedures or the team's approved ORM (Entity Framework
+  Core for .NET services, SQLAlchemy for Python services) over raw SQL.
+- Any exception to this rule requires a written justification and a
+  second reviewer's sign-off from the security team.
+
+Secure Coding Standard: Cryptography
+
+Do not use MD5 or SHA-1 for password hashing or any security-sensitive
+purpose. Use bcrypt or Argon2 for password storage. Use AES-256-GCM for
+symmetric encryption of data at rest.
