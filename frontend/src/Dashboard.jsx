@@ -1,13 +1,13 @@
 import React, { useState, useMemo, useEffect, useRef } from "react";
 import { createPortal } from "react-dom";
-import { ResponsiveContainer, Treemap, Tooltip as RTooltip } from "recharts";
+import { ResponsiveContainer, Treemap, Tooltip as RTooltip, LineChart, Line, XAxis, YAxis } from "recharts";
 import * as d3 from "d3";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import {
   Flame, GitBranch, MessageCircle, Database, ThumbsUp, ThumbsDown, Search, ArrowRight,
   Clock, Send, RefreshCw, Info, Sparkles, ShieldAlert, X, Settings, AlertTriangle, Palette, FileText, Workflow,
-  Check, Loader2,
+  Check, Loader2, TrendingUp, GitPullRequestArrow, Boxes, RotateCw,
 } from "lucide-react";
 import AdminPanel from "./AdminPanel.jsx";
 import { STEP_LABELS } from "./SetupScreen.jsx";
@@ -306,6 +306,64 @@ function groupByDirectory(items) {
     .map(([dir, children]) => ({ name: dir, children }));
 }
 
+// Debt-score trend for one node across past analysis runs, plus any durable
+// gotchas mined from this repo's PR history for that same file — both are
+// read-only overlays on data the analysis (and, for PR insights, a separate
+// opt-in mining step) already computed; neither triggers new work on its own.
+function NodeTrendAndInsights({ nodeId }) {
+  const [trend, setTrend] = useState({ loading: true, points: [] });
+  const [insights, setInsights] = useState({ loading: true, items: [] });
+
+  useEffect(() => {
+    let cancelled = false;
+    setTrend({ loading: true, points: [] });
+    setInsights({ loading: true, items: [] });
+    fetch(`/api/trend?node_id=${encodeURIComponent(nodeId)}`).then((r) => r.json())
+      .then((d) => { if (!cancelled) setTrend({ loading: false, points: d.points || [] }); })
+      .catch(() => { if (!cancelled) setTrend({ loading: false, points: [] }); });
+    fetch(`/api/pr-insights?file_id=${encodeURIComponent(nodeId)}`).then((r) => r.json())
+      .then((d) => { if (!cancelled) setInsights({ loading: false, items: d.items || [] }); })
+      .catch(() => { if (!cancelled) setInsights({ loading: false, items: [] }); });
+    return () => { cancelled = true; };
+  }, [nodeId]);
+
+  if (trend.loading || (trend.points.length < 2 && insights.items.length === 0)) return null;
+
+  return (
+    <div style={{ marginTop: 4, marginBottom: 14 }}>
+      {trend.points.length >= 2 && (
+        <div style={{ marginBottom: 12 }}>
+          <div style={{ fontSize: 11, fontWeight: 700, color: "#5B7290", marginBottom: 4, display: "flex", alignItems: "center", gap: 4 }}>
+            <TrendingUp size={12} /> Debt trend across {trend.points.length} runs
+          </div>
+          <div style={{ height: 56 }}>
+            <ResponsiveContainer width="100%" height="100%">
+              <LineChart data={trend.points} margin={{ top: 4, right: 4, bottom: 0, left: 4 }}>
+                <XAxis dataKey="run_id" hide />
+                <YAxis domain={[0, 1]} hide />
+                <Line type="monotone" dataKey="debt_score" stroke="#0EA5E9" strokeWidth={2} dot={{ r: 2 }} isAnimationActive={false} />
+                <RTooltip formatter={(v) => v.toFixed(2)} labelFormatter={() => ""} contentStyle={{ fontSize: 11, padding: "4px 8px" }} />
+              </LineChart>
+            </ResponsiveContainer>
+          </div>
+        </div>
+      )}
+      {insights.items.length > 0 && (
+        <div>
+          <div style={{ fontSize: 11, fontWeight: 700, color: "#5B7290", marginBottom: 4, display: "flex", alignItems: "center", gap: 4 }}>
+            <GitPullRequestArrow size={12} /> From PR history
+          </div>
+          {insights.items.slice(0, 5).map((it) => (
+            <div key={it.id} style={{ fontSize: 11, color: "#3A4E68", background: "#FBFDFF", border: "1px solid #E1EBF5", borderRadius: 7, padding: "6px 8px", marginBottom: 5, lineHeight: 1.45 }}>
+              {it.insight} {it.source_pr && <span style={{ color: "#93A7BF" }}>(PR #{it.source_pr})</span>}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function HeatmapPane({ items, sizeKey, legendNote, selected, setSelected, goToDeps, detailFields, groupByDir }) {
   const treeData = useMemo(() => {
     if (groupByDir) return groupByDirectory(items);
@@ -358,6 +416,7 @@ function HeatmapPane({ items, sizeKey, legendNote, selected, setSelected, goToDe
               </div>
             )}
             {detailFields.map(([label, key, sub]) => <MetricRow key={key} label={label} value={selected[key]} sub={sub} info={(selected.kind === "table" ? DB_METRIC_INFO : CODE_METRIC_INFO)[key]} />)}
+            <NodeTrendAndInsights nodeId={selected.id} />
             <button onClick={() => goToDeps(selected.id)}
               style={{ marginTop: 12, width: "100%", display: "flex", alignItems: "center", justifyContent: "center", gap: 6, padding: "9px 0", background: "#0EA5E9", color: "white", border: "none", borderRadius: 8, fontSize: 13, fontWeight: 600, cursor: "pointer" }}>
               View dependency map <ArrowRight size={14} />
@@ -376,9 +435,22 @@ function HeatmapPane({ items, sizeKey, legendNote, selected, setSelected, goToDe
 // No side panel needed — clicking a node highlights its neighborhood directly
 // and shows a small floating card next to it.
 // ---------------------------------------------------------------------------
+// Implicit runtime couplings (coupling_analyzer.py) never share a color with
+// a "real" (compile-time) edge type — they're a different kind of claim
+// (heuristic, regex-detected) and should read that way at a glance.
+const COUPLING_EDGE_COLOR = "#DB2777"; // pink — implicit runtime coupling (any coupling_* type)
+const COUPLING_EDGE_LABELS = {
+  coupling_redis: "Shared Redis key/connection",
+  coupling_kafka: "Shared Kafka topic/broker",
+  coupling_queue: "Shared queue/exchange (AMQP/SQS/SNS/etc.)",
+  coupling_shared_key: "Shared literal key (unclassified library)",
+};
+function isCouplingEdge(edgeType) { return typeof edgeType === "string" && edgeType.startsWith("coupling_"); }
+
 function edgeColor(edgeType) {
   if (edgeType === "code_to_table") return "#F59E0B"; // amber, dashed
   if (edgeType === "db_fk") return "#6366F1"; // indigo
+  if (isCouplingEdge(edgeType)) return COUPLING_EDGE_COLOR;
   return "#94A3B8"; // slate — code_import
 }
 
@@ -642,6 +714,7 @@ function FullGraphTab({ nodesById, edges, data, focal, setFocal, filterKind, tie
   const [recommendation, setRecommendation] = useState({ forId: null, loading: false, text: "", error: false, sources: [], kbQuery: "" });
   const [recVoted, setRecVoted] = useState({}); // { [nodeId]: "up" | "down" } — this session's own votes, for button highlighting
   const [recentRecDownvotes, setRecentRecDownvotes] = useState([]);
+  const [blastRadius, setBlastRadius] = useState({ forId: null, loading: false, data: null, error: null, direction: "both" });
 
   useEffect(() => {
     fetch("/api/feedback/recent?vote=down&scope=recommendation&limit=5").then((r) => r.json()).then((d) => setRecentRecDownvotes(d.items || [])).catch(() => {});
@@ -794,6 +867,18 @@ function FullGraphTab({ nodesById, edges, data, focal, setFocal, filterKind, tie
     }
   }
 
+  async function fetchBlastRadius(nodeId, direction) {
+    setBlastRadius({ forId: nodeId, loading: true, data: null, error: null, direction });
+    try {
+      const res = await fetch(`/api/blast-radius?node_id=${encodeURIComponent(nodeId)}&direction=${direction}&max_depth=3`);
+      const json = await res.json();
+      if (!json.ok) { setBlastRadius({ forId: nodeId, loading: false, data: null, error: json.error || "Couldn't compute blast radius.", direction }); return; }
+      setBlastRadius({ forId: nodeId, loading: false, data: json, error: null, direction });
+    } catch {
+      setBlastRadius({ forId: nodeId, loading: false, data: null, error: "Couldn't reach the server.", direction });
+    }
+  }
+
   async function voteOnRecommendation(dir) {
     const nodeId = recommendation.forId;
     if (!nodeId) return;
@@ -883,7 +968,7 @@ function FullGraphTab({ nodesById, edges, data, focal, setFocal, filterKind, tie
     const linkSel = zoomLayer.append("g").selectAll("line").data(simLinks).join("line")
       .attr("stroke", (d) => edgeColor(d.edge_type))
       .attr("stroke-width", (d) => baseEdgeWidth(d, tiered))
-      .attr("stroke-dasharray", (d) => (d.edge_type === "code_to_table" ? "3,3" : null))
+      .attr("stroke-dasharray", (d) => (d.edge_type === "code_to_table" ? "3,3" : isCouplingEdge(d.edge_type) ? "1,3" : null))
       .attr("opacity", (d) => baseEdgeOpacity(d, tiered))
       .attr("marker-end", "url(#arrow)");
     linkSelRef.current = linkSel;
@@ -967,6 +1052,7 @@ function FullGraphTab({ nodesById, edges, data, focal, setFocal, filterKind, tie
   }, [focal, scopedEdges, tiered]);
 
   useEffect(() => { setRecommendation({ forId: null, loading: false, text: "", error: false }); }, [focal]);
+  useEffect(() => { setBlastRadius({ forId: null, loading: false, data: null, error: null, direction: "both" }); }, [focal]);
 
   // Pan/zoom to a node picked from search.
   function centerOn(id) {
@@ -1117,9 +1203,57 @@ function FullGraphTab({ nodesById, edges, data, focal, setFocal, filterKind, tie
               {ins.length === 0 && <span style={{ fontSize: 11, color: "#B7CDE3" }}>None</span>}
             </div>
             <button onClick={() => getRecommendations(focalNode, outs, ins)} disabled={recommendation.loading}
-              style={{ width: "100%", display: "flex", alignItems: "center", justifyContent: "center", gap: 6, padding: "8px 0", background: "#0EA5E9", color: "white", border: "none", borderRadius: 8, fontSize: 12, fontWeight: 600, cursor: "pointer", opacity: recommendation.loading ? 0.6 : 1 }}>
+              style={{ width: "100%", display: "flex", alignItems: "center", justifyContent: "center", gap: 6, padding: "8px 0", background: "#0EA5E9", color: "white", border: "none", borderRadius: 8, fontSize: 12, fontWeight: 600, cursor: "pointer", opacity: recommendation.loading ? 0.6 : 1, marginBottom: 6 }}>
               <Sparkles size={13} /> {recommendation.loading ? "Generating…" : "Get recommendations"}
             </button>
+            <button onClick={() => fetchBlastRadius(focal, "both")} disabled={blastRadius.loading}
+              title="What's upstream and downstream of this node, up to 3 hops out"
+              style={{ width: "100%", display: "flex", alignItems: "center", justifyContent: "center", gap: 6, padding: "8px 0", background: "#FFFFFF", color: "#DB2777", border: "1px solid #F5B8D6", borderRadius: 8, fontSize: 12, fontWeight: 600, cursor: "pointer", opacity: blastRadius.loading ? 0.6 : 1 }}>
+              <Workflow size={13} /> {blastRadius.loading ? "Computing…" : "Blast radius"}
+            </button>
+          </div>
+        )}
+
+        {blastRadius.forId === focal && (blastRadius.data || blastRadius.error || blastRadius.loading) && (
+          <div style={{ position: "absolute", bottom: 50, right: 14, width: 300, maxHeight: "calc(100% - 200px)", overflowY: "auto", background: "#FFFFFF", border: "1px solid #F5B8D6", borderRadius: 10, padding: 14, boxShadow: "0 12px 32px rgba(15,37,64,0.16)" }}>
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 8 }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, fontWeight: 700, color: "#DB2777" }}><Workflow size={13} /> Blast radius: {shortName(focal)}</div>
+              <button onClick={() => setBlastRadius({ forId: null, loading: false, data: null, error: null, direction: "both" })} style={{ background: "none", border: "none", cursor: "pointer", color: "#93A7BF" }}><X size={14} /></button>
+            </div>
+            <div style={{ display: "flex", gap: 4, marginBottom: 10 }}>
+              {[["both", "Both"], ["upstream", "Upstream (relies on)"], ["downstream", "Downstream (relies on this)"]].map(([key, label]) => (
+                <button key={key} onClick={() => fetchBlastRadius(focal, key)}
+                  style={{ fontSize: 10, fontWeight: 600, padding: "4px 7px", borderRadius: 6, cursor: "pointer", border: blastRadius.direction === key ? "1.5px solid #DB2777" : "1px solid #E1EBF5", background: blastRadius.direction === key ? "#FCE7F3" : "#FFFFFF", color: blastRadius.direction === key ? "#DB2777" : "#5B7290" }}>
+                  {label}
+                </button>
+              ))}
+            </div>
+            {blastRadius.loading && <div style={{ fontSize: 12.5, color: "#93A7BF" }}>Walking the dependency graph…</div>}
+            {blastRadius.error && <div style={{ fontSize: 12.5, color: "#9F1D1D" }}>{blastRadius.error}</div>}
+            {blastRadius.data && (
+              <>
+                <div style={{ display: "flex", gap: 10, marginBottom: 10, fontSize: 11, color: "#5B7290" }}>
+                  <span><b style={{ color: "#0F2540" }}>{blastRadius.data.summary.total_affected}</b> affected</span>
+                  <span><b style={{ color: "#DC2626" }}>{blastRadius.data.summary.high_debt_count}</b> high-debt</span>
+                </div>
+                {blastRadius.data.nodes.length === 0 ? (
+                  <div style={{ fontSize: 11.5, color: "#93A7BF" }}>Nothing reachable in this direction within 3 hops.</div>
+                ) : (
+                  blastRadius.data.nodes.slice(0, 40).map((n) => (
+                    <div key={n.id} onClick={() => n.kind !== "external" && centerOn(n.id)}
+                      style={{ display: "flex", alignItems: "center", gap: 6, padding: "5px 0", borderBottom: "1px solid #F5F5FA", cursor: n.kind !== "external" ? "pointer" : "default" }}>
+                      <span style={{ fontSize: 9.5, fontWeight: 700, color: "#93A7BF", width: 34, flexShrink: 0 }}>{n.hops}h {n.direction === "upstream" ? "↑" : "↓"}</span>
+                      <span style={{ fontSize: 11, fontFamily: "'IBM Plex Mono', monospace", color: "#0F2540", flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={n.id}>{shortName(n.id)}</span>
+                      {n.debt_score != null && (
+                        <span style={{ fontSize: 9.5, fontWeight: 700, color: textOnColor(debtColor(n.debt_score)), background: debtColor(n.debt_score), borderRadius: 99, padding: "1px 6px", flexShrink: 0 }}>{n.debt_score.toFixed(2)}</span>
+                      )}
+                      {isCouplingEdge(n.edge_type) && <span title={COUPLING_EDGE_LABELS[n.edge_type] || n.edge_type} style={{ fontSize: 9, color: COUPLING_EDGE_COLOR, flexShrink: 0 }}>⚡</span>}
+                    </div>
+                  ))
+                )}
+                {blastRadius.data.nodes.length > 40 && <div style={{ fontSize: 10.5, color: "#93A7BF", marginTop: 6 }}>…and {blastRadius.data.nodes.length - 40} more.</div>}
+              </>
+            )}
           </div>
         )}
 
@@ -1159,6 +1293,7 @@ function FullGraphTab({ nodesById, edges, data, focal, setFocal, filterKind, tie
           <span>▪ square = table</span>
           <span style={{ color: "#6366F1" }}>— foreign key</span>
           <span style={{ color: "#F59E0B" }}>┄ code → table</span>
+          {edges.some((e) => isCouplingEdge(e.edge_type)) && <span style={{ color: COUPLING_EDGE_COLOR }}>┄ implicit runtime coupling (shared cache/queue/topic)</span>}
           {tiered && <span>bright/thick edge = crosses a tier · faint edge = stays within one</span>}
         </div>
       </div>
@@ -1167,6 +1302,152 @@ function FullGraphTab({ nodesById, edges, data, focal, setFocal, filterKind, tie
   );
 }
 
+
+// ---------------------------------------------------------------------------
+// Architecture tab — AI-authored module narratives (module_narrative.py)
+// ---------------------------------------------------------------------------
+function ModuleCard({ mod, onGenerate, generating }) {
+  const [expanded, setExpanded] = useState(false);
+  const hasNarrative = !!mod.narrative;
+  return (
+    <div style={{ background: "#FFFFFF", border: "1px solid #E1EBF5", borderRadius: 12, padding: 16, marginBottom: 12 }}>
+      <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 10 }}>
+        <div style={{ minWidth: 0, flex: 1 }}>
+          <div style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 13, fontWeight: 700, color: "#0F2540", wordBreak: "break-all" }}>{mod.module_id}</div>
+          {hasNarrative && mod.narrative.role && <div style={{ fontSize: 12.5, color: "#5B7290", marginTop: 3 }}>{mod.narrative.role}</div>}
+          <div style={{ display: "flex", gap: 12, marginTop: 8, fontSize: 11, color: "#93A7BF" }}>
+            <span>{mod.file_count} file{mod.file_count === 1 ? "" : "s"}</span>
+            <span>{mod.total_loc.toLocaleString()} loc</span>
+            {mod.high_debt_count > 0 && <span style={{ color: "#DC2626", fontWeight: 600 }}>{mod.high_debt_count} high-debt</span>}
+          </div>
+        </div>
+        <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 6, flexShrink: 0 }}>
+          <span style={{ fontSize: 12, fontWeight: 700, padding: "3px 9px", borderRadius: 99, background: debtColor(mod.avg_debt), color: textOnColor(debtColor(mod.avg_debt)) }}>
+            avg {mod.avg_debt.toFixed(2)}
+          </span>
+          {mod.narrative_stale && hasNarrative && (
+            <span title="This module's files/metrics changed since this narrative was generated" style={{ fontSize: 9.5, color: "#B45309", display: "flex", alignItems: "center", gap: 3 }}>
+              <RotateCw size={9} /> stale
+            </span>
+          )}
+        </div>
+      </div>
+
+      {mod.narrative_status === "error" && (
+        <div style={{ marginTop: 10, fontSize: 11.5, color: "#9F1D1D", background: "#FDECEC", border: "1px solid #F5C6C6", borderRadius: 7, padding: "6px 9px" }}>
+          Narrative generation failed: {mod.narrative_error}
+        </div>
+      )}
+      {mod.narrative_status === "running" && (
+        <div style={{ marginTop: 10, fontSize: 11.5, color: "#93A7BF", display: "flex", alignItems: "center", gap: 6 }}>
+          <Loader2 size={12} className="spin-dashboard" /> Generating narrative…
+        </div>
+      )}
+
+      {hasNarrative && (
+        <div style={{ marginTop: 10 }}>
+          <button onClick={() => setExpanded((e) => !e)} style={{ background: "none", border: "none", padding: 0, cursor: "pointer", fontSize: 11.5, color: "#0369A1", fontWeight: 600, display: "flex", alignItems: "center", gap: 4 }}>
+            <Info size={12} /> {expanded ? "Hide details" : "Responsibilities, key files & concerns"}
+          </button>
+          {expanded && (
+            <div style={{ marginTop: 8, fontSize: 12, color: "#3A4E68", lineHeight: 1.6 }}>
+              {mod.narrative.responsibilities?.length > 0 && (
+                <div style={{ marginBottom: 8 }}>
+                  <div style={{ fontWeight: 700, color: "#0F2540", fontSize: 11 }}>Responsibilities</div>
+                  <ul style={{ margin: "3px 0 0", paddingLeft: 18 }}>{mod.narrative.responsibilities.map((r, i) => <li key={i}>{r}</li>)}</ul>
+                </div>
+              )}
+              {mod.narrative.key_files?.length > 0 && (
+                <div style={{ marginBottom: 8 }}>
+                  <div style={{ fontWeight: 700, color: "#0F2540", fontSize: 11 }}>Key files</div>
+                  <ul style={{ margin: "3px 0 0", paddingLeft: 18 }}>{mod.narrative.key_files.map((r, i) => <li key={i} style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 11 }}>{r}</li>)}</ul>
+                </div>
+              )}
+              {mod.narrative.concerns?.length > 0 && (
+                <div>
+                  <div style={{ fontWeight: 700, color: "#0F2540", fontSize: 11 }}>Concerns</div>
+                  <ul style={{ margin: "3px 0 0", paddingLeft: 18 }}>{mod.narrative.concerns.map((r, i) => <li key={i}>{r}</li>)}</ul>
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+      )}
+
+      {(!hasNarrative || mod.narrative_stale) && mod.narrative_status !== "running" && (
+        <button onClick={() => onGenerate(mod.module_id)} disabled={generating}
+          style={{ marginTop: 10, display: "flex", alignItems: "center", gap: 6, padding: "6px 12px", background: hasNarrative ? "#FFFFFF" : "#0EA5E9", color: hasNarrative ? "#0369A1" : "white", border: hasNarrative ? "1px solid #CDE9FB" : "none", borderRadius: 7, fontSize: 11.5, fontWeight: 600, cursor: "pointer", opacity: generating ? 0.6 : 1 }}>
+          <Sparkles size={12} /> {hasNarrative ? "Regenerate narrative" : "Generate narrative"}
+        </button>
+      )}
+    </div>
+  );
+}
+
+function ArchitectureTab() {
+  const [state, setState] = useState({ loading: true, modules: [], error: null });
+  const [generating, setGenerating] = useState({}); // { [module_id]: true }
+  const pollRef = useRef(null);
+
+  async function load() {
+    try {
+      const res = await fetch("/api/modules");
+      const json = await res.json();
+      if (!json.ok && json.error) { setState({ loading: false, modules: [], error: json.error }); return; }
+      setState({ loading: false, modules: json.modules || [], error: null });
+    } catch {
+      setState({ loading: false, modules: [], error: "Couldn't reach the server." });
+    }
+  }
+
+  useEffect(() => {
+    load();
+    return () => { if (pollRef.current) clearInterval(pollRef.current); };
+  }, []);
+
+  async function generate(moduleId) {
+    setGenerating((g) => ({ ...g, [moduleId]: true }));
+    try {
+      await fetch("/api/modules/generate", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ module_id: moduleId }) });
+    } catch { /* surfaced via the module's own narrative_status on next poll */ }
+    load();
+    // Narrative generation is an LLM call running server-side in the
+    // background — poll until this module (and any other still-running one)
+    // settles, same pattern as the top-level analysis job's polling.
+    if (pollRef.current) clearInterval(pollRef.current);
+    let ticks = 0;
+    pollRef.current = setInterval(async () => {
+      ticks += 1;
+      await load();
+      if (ticks > 30) { clearInterval(pollRef.current); pollRef.current = null; } // ~60s safety stop
+    }, 2000);
+  }
+
+  useEffect(() => {
+    if (!state.modules.some((m) => m.narrative_status === "running")) {
+      if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null; }
+      setGenerating({});
+    }
+  }, [state.modules]);
+
+  if (state.loading) return <div style={{ fontSize: 13, color: "#93A7BF", padding: 30 }}>Loading modules…</div>;
+  if (state.error) return <div style={{ background: "#F3F8FD", border: "1px dashed #C7DBEE", borderRadius: 12, padding: 40, textAlign: "center", color: "#5B7290", fontSize: 13.5 }}>{state.error}</div>;
+  if (state.modules.length === 0) return <div style={{ background: "#F3F8FD", border: "1px dashed #C7DBEE", borderRadius: 12, padding: 40, textAlign: "center", color: "#5B7290", fontSize: 13.5 }}>No modules found in the last analysis.</div>;
+
+  return (
+    <div>
+      <div style={{ display: "flex", alignItems: "flex-start", gap: 8, marginBottom: 14, padding: "9px 12px", background: "#F8FBFF", border: "1px solid #E1EBF5", borderRadius: 10 }}>
+        <Boxes size={15} style={{ flexShrink: 0, marginTop: 1, color: "#0369A1" }} />
+        <div style={{ fontSize: 11.5, color: "#3A4E68", lineHeight: 1.55 }}>
+          Files grouped by folder, sorted by average debt. Narratives are generated on demand (they call the AI provider configured in Admin) and cached until that module's files or metrics change — click "Generate narrative" on any module you want a written summary for.
+        </div>
+      </div>
+      {state.modules.map((mod) => (
+        <ModuleCard key={mod.module_id} mod={mod} onGenerate={generate} generating={!!generating[mod.module_id] || mod.narrative_status === "running"} />
+      ))}
+    </div>
+  );
+}
 
 // ---------------------------------------------------------------------------
 // Chat / guidance tab
@@ -1460,6 +1741,7 @@ export default function Dashboard({ data, onReanalyze, jobRunning, jobStep, jobE
     { id: "heat", label: "Code heatmap", icon: Flame },
     { id: "db", label: "DB heatmap", icon: Database },
     { id: "flow", label: "Dependency flow", icon: Workflow },
+    { id: "arch", label: "Architecture", icon: Boxes },
     { id: "chat", label: "Ask", icon: MessageCircle },
   ];
 
@@ -1559,6 +1841,7 @@ export default function Dashboard({ data, onReanalyze, jobRunning, jobStep, jobE
             ) : <NoDbNotice onReanalyze={onReanalyze} />
           )}
           {tab === "flow" && <FullGraphTab nodesById={nodesById} edges={data.edges} data={data} focal={focal} setFocal={setFocal} tiered emptyLabel="No dependency data yet." />}
+          {tab === "arch" && <ArchitectureTab />}
           {tab === "chat" && <ChatTab data={data} />}
         </main>
       </div>

@@ -32,11 +32,15 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
 import code_analyzers
+import coupling_analyzer
 import db_analyzers
 import external_context
+import graph_queries
 import knowledge_base
 import llm_providers
+import module_narrative
 import multi_source
+import pr_context
 
 BASE_DIR = Path(__file__).parent
 DATA_DIR = BASE_DIR / "app_data"
@@ -51,7 +55,11 @@ app = FastAPI()
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 JOB = {"status": "idle", "step": "", "error": None}  # single-job app — one analysis at a time
-FILE_PATHS = {}  # {namespaced_file_id: absolute_path}, rebuilt on every analysis — backs /api/file-source
+FILE_PATHS = {}    # {namespaced_file_id: absolute_path}, rebuilt on every analysis — backs /api/file-source
+SOURCE_TEXT = {}    # {namespaced_file_id: raw text}, rebuilt on every analysis — backs on-demand module narrative generation
+REPO_SLUGS = []      # slugs seen in the most recent analysis — backs module grouping and PR mining's repo->path lookup
+REPO_PATHS = {}    # {slug: local filesystem path} — used by PR mining to run `git remote get-url origin` against the right clone
+PR_MINING_JOBS = {}  # {repo_slug: {"status": "idle"|"running"|"done"|"error", "error": str|None}}
 
 
 def init_app_db():
@@ -61,6 +69,40 @@ def init_app_db():
     cur.execute("""CREATE TABLE IF NOT EXISTS chat_feedback (
         id INTEGER PRIMARY KEY AUTOINCREMENT, question TEXT, answer TEXT,
         vote TEXT, node_id TEXT, created_at TEXT)""")
+
+    # --- trend history: additive, never dropped on re-analysis (unlike the
+    # snapshot tables in DB_PATH/write_sqlite) so a run's numbers stay
+    # queryable after the next run overwrites the "current" snapshot. ---
+    cur.execute("""CREATE TABLE IF NOT EXISTS analysis_runs (
+        run_id INTEGER PRIMARY KEY AUTOINCREMENT, generated_at TEXT, repo_label TEXT,
+        total_files INTEGER, total_tables INTEGER, total_edges INTEGER,
+        avg_code_debt REAL, avg_db_debt REAL, high_debt_count INTEGER)""")
+    cur.execute("""CREATE TABLE IF NOT EXISTS node_debt_history (
+        run_id INTEGER, node_id TEXT, kind TEXT, debt_score REAL,
+        FOREIGN KEY(run_id) REFERENCES analysis_runs(run_id))""")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_node_debt_history_node ON node_debt_history(node_id)")
+
+    # --- PR-history mining results, keyed loosely by file suffix so a PR's
+    # file path ("backend/app.py") still matches our namespaced file id
+    # ("myrepo/backend/app.py") without requiring an exact match. ---
+    cur.execute("""CREATE TABLE IF NOT EXISTS pr_insights (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, repo_slug TEXT, file_hint TEXT,
+        insight TEXT, source_pr INTEGER, created_at TEXT)""")
+
+    # --- cached AI module narratives, keyed by module id + a content hash so
+    # a narrative is only regenerated when its module's files/metrics change. ---
+    cur.execute("""CREATE TABLE IF NOT EXISTS module_narratives (
+        module_id TEXT PRIMARY KEY, content_hash TEXT, summary_json TEXT,
+        narrative_json TEXT, status TEXT, error TEXT, generated_at TEXT)""")
+
+    # --- MCP-proposed annotations on a graph node. Nothing here ever changes
+    # a debt score or the graph itself — annotate_node (the MCP server's one
+    # write tool) only ever inserts a "pending" row; a human approves or
+    # rejects it from the Admin panel. ---
+    cur.execute("""CREATE TABLE IF NOT EXISTS graph_annotations (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, node_id TEXT, note TEXT, author TEXT,
+        status TEXT DEFAULT 'pending', created_at TEXT, decided_at TEXT)""")
+
     conn.commit()
     conn.close()
 
@@ -180,8 +222,35 @@ def write_sqlite(files, tables, edges):
     conn.close()
 
 
+def record_run_history(payload):
+    """Appends one row to analysis_runs plus one row per file/table to
+    node_debt_history — additive, never overwritten, so /api/trend can chart
+    a node's (or the whole codebase's) debt score across every past run.
+    Best-effort: a history-write failure should never fail the analysis that
+    already succeeded and is already on disk in METRICS_PATH."""
+    try:
+        conn = sqlite3.connect(APP_DB_PATH)
+        cur = conn.cursor()
+        cur.execute(
+            """INSERT INTO analysis_runs
+               (generated_at, repo_label, total_files, total_tables, total_edges, avg_code_debt, avg_db_debt, high_debt_count)
+               VALUES (?,?,?,?,?,?,?,?)""",
+            (payload["generated_at"], payload["repo"], payload["summary"]["total_files"], payload["summary"]["total_tables"],
+             payload["summary"]["total_edges"], payload["summary"]["avg_code_debt"], payload["summary"]["avg_db_debt"],
+             payload["summary"]["high_debt_count"]),
+        )
+        run_id = cur.lastrowid
+        rows = [(run_id, f["file"], "file", f["debt_score"]) for f in payload["files"]]
+        rows += [(run_id, t["file"], "table", t["debt_score"]) for t in payload["tables"]]
+        cur.executemany("INSERT INTO node_debt_history (run_id, node_id, kind, debt_score) VALUES (?,?,?,?)", rows)
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass  # trend history is a nice-to-have overlay, never a reason to mark a completed analysis as failed
+
+
 def run_analysis(req: AnalyzeRequest):
-    global FILE_PATHS
+    global FILE_PATHS, SOURCE_TEXT, REPO_SLUGS, REPO_PATHS
     try:
         JOB.update(status="running", step="resolving repositories", error=None)
 
@@ -201,8 +270,14 @@ def run_analysis(req: AnalyzeRequest):
         code_edges = code_result["edges"]
         source_text = code_result["source_text"]
         FILE_PATHS = code_result["file_paths"]
+        SOURCE_TEXT = source_text
+        REPO_SLUGS = [r["slug"] for r in repo_specs]
+        REPO_PATHS = {r["slug"]: r["path"] for r in repo_specs}
         code_langs = code_result["code_langs"]
         frameworks = code_result["frameworks"]
+
+        JOB["step"] = "detecting implicit runtime coupling (shared caches/queues/services)"
+        coupling_edges = coupling_analyzer.detect_coupling(source_text)
 
         db_slugs_seen = set()
         db_specs = []
@@ -246,7 +321,7 @@ def run_analysis(req: AnalyzeRequest):
                 )
 
         all_nodes = files + tables
-        all_edges = code_edges + db_edges + code_to_table_edges
+        all_edges = code_edges + db_edges + code_to_table_edges + coupling_edges
 
         JOB["step"] = "writing results"
         write_sqlite(files, tables, all_edges)
@@ -290,6 +365,7 @@ def run_analysis(req: AnalyzeRequest):
         }
         with open(METRICS_PATH, "w") as fh:
             json.dump(payload, fh)
+        record_run_history(payload)
         JOB.update(status="done", step="complete")
     except Exception as e:
         JOB.update(status="error", error=str(e))
@@ -425,6 +501,8 @@ class SettingsRequest(BaseModel):
     ollama_base_url: str | None = None
     atlassian_email: str | None = None            # Jira + Confluence Cloud share one credential pair
     atlassian_api_token: str | None = None
+    github_token: str | None = None    # optional — raises PR-mining's API rate limit and unlocks private repos
+    gitlab_token: str | None = None    # optional — same, for gitlab.com
 
 
 def _mask(key):
@@ -457,6 +535,12 @@ def get_settings():
         "has_token": bool(stored_token),
         "token_preview": _mask(stored_token),
     }
+    out["pr_mining"] = {
+        "github_has_token": bool(get_setting("github_token", "")),
+        "github_token_preview": _mask(get_setting("github_token", "")),
+        "gitlab_has_token": bool(get_setting("gitlab_token", "")),
+        "gitlab_token_preview": _mask(get_setting("gitlab_token", "")),
+    }
     return out
 
 
@@ -477,6 +561,10 @@ def save_settings(req: SettingsRequest):
         set_setting("atlassian_email", req.atlassian_email)
     if req.atlassian_api_token:  # only overwrite if the user actually typed something
         set_setting("atlassian_api_token", req.atlassian_api_token)
+    if req.github_token:
+        set_setting("github_token", req.github_token)
+    if req.gitlab_token:
+        set_setting("gitlab_token", req.gitlab_token)
     return {"ok": True}
 
 
@@ -523,6 +611,250 @@ def feedback_stats():
     down = conn.execute("SELECT COUNT(*) FROM chat_feedback WHERE vote='down'").fetchone()[0]
     conn.close()
     return {"up": up, "down": down}
+
+
+def _load_current_metrics():
+    if not METRICS_PATH.exists():
+        return None
+    with open(METRICS_PATH) as fh:
+        return json.load(fh)
+
+
+def _nodes_by_id(data):
+    return {n["file"]: n for n in data.get("files", []) + data.get("tables", [])}
+
+
+# --- Blast radius (change-impact queries) ---------------------------------
+
+@app.get("/api/blast-radius")
+def blast_radius(node_id: str, direction: str = "both", max_depth: int = 3):
+    data = _load_current_metrics()
+    if not data:
+        return {"ok": False, "error": "No analysis has been run yet."}
+    if direction not in ("upstream", "downstream", "both"):
+        raise HTTPException(status_code=400, detail="direction must be 'upstream', 'downstream', or 'both'")
+    max_depth = max(1, min(max_depth, 10))
+    result = graph_queries.blast_radius(node_id, data.get("edges", []), direction=direction, max_depth=max_depth)
+    graph_queries.enrich_with_node_data(result, _nodes_by_id(data))
+    return {"ok": True, **result}
+
+
+# --- Trend history across analysis runs ------------------------------------
+
+@app.get("/api/runs")
+def list_runs(limit: int = 50):
+    conn = sqlite3.connect(APP_DB_PATH)
+    rows = conn.execute(
+        """SELECT run_id, generated_at, repo_label, total_files, total_tables, total_edges,
+                  avg_code_debt, avg_db_debt, high_debt_count
+           FROM analysis_runs ORDER BY run_id DESC LIMIT ?""",
+        (limit,),
+    ).fetchall()
+    conn.close()
+    cols = ["run_id", "generated_at", "repo_label", "total_files", "total_tables", "total_edges", "avg_code_debt", "avg_db_debt", "high_debt_count"]
+    return {"runs": [dict(zip(cols, r)) for r in reversed(rows)]}  # oldest-first, ready to feed straight into a chart
+
+
+@app.get("/api/trend")
+def node_trend(node_id: str, limit: int = 50):
+    conn = sqlite3.connect(APP_DB_PATH)
+    rows = conn.execute(
+        """SELECT ar.run_id, ar.generated_at, h.debt_score
+           FROM node_debt_history h JOIN analysis_runs ar ON ar.run_id = h.run_id
+           WHERE h.node_id = ? ORDER BY ar.run_id DESC LIMIT ?""",
+        (node_id, limit),
+    ).fetchall()
+    conn.close()
+    points = [{"run_id": r[0], "generated_at": r[1], "debt_score": r[2]} for r in reversed(rows)]
+    return {"node_id": node_id, "points": points}
+
+
+# --- PR-history mining -------------------------------------------------------
+
+def _pr_mining_job(repo_slug, repo_path):
+    PR_MINING_JOBS[repo_slug] = {"status": "running", "error": None}
+    try:
+        provider = get_setting("active_provider", "anthropic")
+        model = get_setting(f"{provider}_model", llm_providers.PROVIDERS[provider]["default_model"])
+        api_key = get_setting(f"{provider}_api_key")
+        if not api_key and provider == "anthropic":
+            api_key = os.environ.get("ANTHROPIC_API_KEY") or HARDCODED_ANTHROPIC_API_KEY
+        base_url = get_setting("ollama_base_url", llm_providers.DEFAULT_OLLAMA_BASE_URL) if provider == "ollama" else None
+        remote = pr_context.detect_remote(repo_path)
+        token = None
+        if remote:
+            token = get_setting(f"{remote['host']}_token")  # optional — set via Admin panel; raises the API rate limit and unlocks private repos
+        result = pr_context.mine_repo(repo_path, provider, model, api_key, base_url=base_url, token=token)
+        if not result.get("ok"):
+            PR_MINING_JOBS[repo_slug] = {"status": "error", "error": result.get("error")}
+            return
+        conn = sqlite3.connect(APP_DB_PATH)
+        now = datetime.now(timezone.utc).isoformat()
+        conn.executemany(
+            "INSERT INTO pr_insights (repo_slug, file_hint, insight, source_pr, created_at) VALUES (?,?,?,?,?)",
+            [(repo_slug, ins["file"], ins["insight"], ins.get("source_pr"), now) for ins in result.get("insights", [])],
+        )
+        conn.commit()
+        conn.close()
+        PR_MINING_JOBS[repo_slug] = {"status": "done", "error": None}
+    except Exception as e:
+        PR_MINING_JOBS[repo_slug] = {"status": "error", "error": str(e)}
+
+
+class MinePrRequest(BaseModel):
+    repo_slug: str
+
+
+@app.post("/api/pr-insights/mine")
+def mine_pr_insights(req: MinePrRequest):
+    repo_path = REPO_PATHS.get(req.repo_slug)
+    if not repo_path:
+        return {"ok": False, "error": "Unknown repo slug (re-run analysis first — repo paths aren't kept across a server restart)."}
+    if PR_MINING_JOBS.get(req.repo_slug, {}).get("status") == "running":
+        return {"ok": False, "error": "PR mining is already running for this repo."}
+    t = threading.Thread(target=_pr_mining_job, args=(req.repo_slug, repo_path), daemon=True)
+    t.start()
+    return {"ok": True}
+
+
+@app.get("/api/pr-insights/status")
+def pr_insights_status(repo_slug: str):
+    return PR_MINING_JOBS.get(repo_slug, {"status": "idle", "error": None})
+
+
+@app.get("/api/pr-insights")
+def pr_insights(file_id: str = None, repo_slug: str = None):
+    conn = sqlite3.connect(APP_DB_PATH)
+    if repo_slug:
+        rows = conn.execute(
+            "SELECT id, repo_slug, file_hint, insight, source_pr, created_at FROM pr_insights WHERE repo_slug = ? ORDER BY id DESC",
+            (repo_slug,),
+        ).fetchall()
+    else:
+        rows = conn.execute("SELECT id, repo_slug, file_hint, insight, source_pr, created_at FROM pr_insights ORDER BY id DESC").fetchall()
+    conn.close()
+    cols = ["id", "repo_slug", "file_hint", "insight", "source_pr", "created_at"]
+    items = [dict(zip(cols, r)) for r in rows]
+    if file_id:
+        # a PR's file path ("backend/app.py") won't exactly equal our namespaced
+        # file id ("myrepo/backend/app.py") — match on suffix in either direction
+        items = [it for it in items if it["file_hint"] and (file_id.endswith(it["file_hint"]) or it["file_hint"].endswith(file_id.split("/", 1)[-1]))]
+    return {"items": items}
+
+
+# --- AI module/architecture narratives ---------------------------------------
+
+@app.get("/api/modules")
+def list_modules():
+    data = _load_current_metrics()
+    if not data:
+        return {"ok": False, "error": "No analysis has been run yet."}
+    modules = module_narrative.group_into_modules(data.get("files", []), REPO_SLUGS or [r["slug"] for r in data.get("repos", [])])
+    conn = sqlite3.connect(APP_DB_PATH)
+    cached = {row[0]: row for row in conn.execute("SELECT module_id, content_hash, narrative_json, status, error, generated_at FROM module_narratives")}
+    conn.close()
+    out = []
+    for module_id, file_list in modules.items():
+        summary = module_narrative.build_module_summary(module_id, file_list)
+        row = cached.get(module_id)
+        entry = {**summary, "narrative": None, "narrative_status": "not_generated", "narrative_stale": False, "narrative_error": None}
+        if row:
+            _, cached_hash, narrative_json, status, error, generated_at = row
+            entry["narrative"] = json.loads(narrative_json) if narrative_json else None
+            entry["narrative_status"] = status
+            entry["narrative_error"] = error
+            entry["narrative_stale"] = cached_hash != summary["content_hash"]
+            entry["generated_at"] = generated_at
+        out.append(entry)
+    out.sort(key=lambda m: m["avg_debt"], reverse=True)
+    return {"modules": out}
+
+
+def _generate_module_job(module_id, file_list, summary):
+    conn = sqlite3.connect(APP_DB_PATH)
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        """INSERT INTO module_narratives (module_id, content_hash, summary_json, narrative_json, status, error, generated_at)
+           VALUES (?,?,?,?,?,?,?)
+           ON CONFLICT(module_id) DO UPDATE SET content_hash=excluded.content_hash, summary_json=excluded.summary_json,
+               status=excluded.status, error=excluded.error, generated_at=excluded.generated_at""",
+        (module_id, summary["content_hash"], json.dumps(summary), None, "running", None, now),
+    )
+    conn.commit()
+    conn.close()
+
+    provider = get_setting("active_provider", "anthropic")
+    model = get_setting(f"{provider}_model", llm_providers.PROVIDERS[provider]["default_model"])
+    api_key = get_setting(f"{provider}_api_key")
+    if not api_key and provider == "anthropic":
+        api_key = os.environ.get("ANTHROPIC_API_KEY") or HARDCODED_ANTHROPIC_API_KEY
+    base_url = get_setting("ollama_base_url", llm_providers.DEFAULT_OLLAMA_BASE_URL) if provider == "ollama" else None
+
+    result = module_narrative.generate_narrative(module_id, file_list, SOURCE_TEXT, provider, model, api_key, base_url=base_url)
+    conn = sqlite3.connect(APP_DB_PATH)
+    if result["ok"]:
+        conn.execute(
+            "UPDATE module_narratives SET narrative_json = ?, status = 'done', error = NULL WHERE module_id = ?",
+            (json.dumps(result["narrative"]), module_id),
+        )
+    else:
+        conn.execute("UPDATE module_narratives SET status = 'error', error = ? WHERE module_id = ?", (result["error"], module_id))
+    conn.commit()
+    conn.close()
+
+
+class GenerateModuleRequest(BaseModel):
+    module_id: str
+
+
+@app.post("/api/modules/generate")
+def generate_module(req: GenerateModuleRequest):
+    data = _load_current_metrics()
+    if not data:
+        return {"ok": False, "error": "No analysis has been run yet."}
+    modules = module_narrative.group_into_modules(data.get("files", []), REPO_SLUGS or [r["slug"] for r in data.get("repos", [])])
+    file_list = modules.get(req.module_id)
+    if not file_list:
+        return {"ok": False, "error": "Unknown module id (re-run analysis if the codebase changed)."}
+    summary = module_narrative.build_module_summary(req.module_id, file_list)
+    t = threading.Thread(target=_generate_module_job, args=(req.module_id, file_list, summary), daemon=True)
+    t.start()
+    return {"ok": True}
+
+
+# --- Graph annotations (MCP write tool -> human approval queue) -------------
+
+@app.get("/api/annotations")
+def list_annotations(status: str = "pending"):
+    conn = sqlite3.connect(APP_DB_PATH)
+    if status == "all":
+        rows = conn.execute("SELECT id, node_id, note, author, status, created_at, decided_at FROM graph_annotations ORDER BY id DESC").fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT id, node_id, note, author, status, created_at, decided_at FROM graph_annotations WHERE status = ? ORDER BY id DESC",
+            (status,),
+        ).fetchall()
+    conn.close()
+    cols = ["id", "node_id", "note", "author", "status", "created_at", "decided_at"]
+    return {"items": [dict(zip(cols, r)) for r in rows]}
+
+
+@app.post("/api/annotations/{annotation_id}/approve")
+def approve_annotation(annotation_id: int):
+    conn = sqlite3.connect(APP_DB_PATH)
+    conn.execute("UPDATE graph_annotations SET status = 'approved', decided_at = ? WHERE id = ?", (datetime.now(timezone.utc).isoformat(), annotation_id))
+    conn.commit()
+    conn.close()
+    return {"ok": True}
+
+
+@app.post("/api/annotations/{annotation_id}/reject")
+def reject_annotation(annotation_id: int):
+    conn = sqlite3.connect(APP_DB_PATH)
+    conn.execute("UPDATE graph_annotations SET status = 'rejected', decided_at = ? WHERE id = ?", (datetime.now(timezone.utc).isoformat(), annotation_id))
+    conn.commit()
+    conn.close()
+    return {"ok": True}
 
 
 # --- serve the built frontend (npm run build -> ../frontend/dist) ---

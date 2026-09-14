@@ -6,7 +6,14 @@ dependency graph, and gives you heatmaps, an interactive graph, and AI
 guidance grounded in the real metrics — now optionally enriched with Jira/
 Confluence context, and extended to critique SOLID/design-pattern/reusability
 concerns with concrete code-level fixes, not just complexity/security/design
-smells.
+smells. It also now detects implicit runtime coupling (shared caches/
+queues), mines PR history for durable gotchas, writes AI module narratives,
+answers blast-radius/change-impact queries, tracks debt trends across runs,
+and exposes all of it to MCP-speaking agents (Claude Code, Cursor, etc.) via
+`backend/mcp_server.py` — everything still runs entirely on your own
+infrastructure, no managed service, no data leaving the host you run it on
+(beyond calls you configure to an AI provider or, opt-in, GitHub/GitLab's
+API for PR mining).
 
 ## Run it
 
@@ -87,6 +94,44 @@ component, explaining exactly what it measures and how it's computed.
 * **Multi-provider AI** — Claude, Gemini, or Sarvam AI, switchable from
 Admin. Gemini and Sarvam are both called through their OpenAI-compatible
 endpoints.
+* **MCP server** (`backend/mcp_server.py`) — exposes the last analysis run to
+  any MCP-speaking agent (Claude Code, Cursor, Claude Desktop, ...): project
+  overview, per-module info, per-file/table metrics, one-hop dependencies,
+  blast-radius queries, PR-history insights, and a grounded Q&A tool. Reads
+  the same on-disk artifacts this web app writes, so it works even when the
+  web server isn't running. Its one write tool, `annotate_node`, only ever
+  proposes a note for a human to approve from Admin — see "Pending
+  annotations" below.
+* **Implicit runtime coupling detection** (`backend/coupling_analyzer.py`) —
+  a heuristic pass over every analyzed file's source (any language) that
+  flags two files sharing the same Redis key, Kafka topic, or queue/exchange
+  name (or the same well-known connection env var) as coupled, even with no
+  import between them. Shown as pink edges in the dependency graph, tagged
+  `coupling_redis` / `coupling_kafka` / `coupling_queue`.
+* **Blast-radius / change-impact queries** (`backend/graph_queries.py`) —
+  click any node in the dependency graph and hit "Blast radius" for a
+  multi-hop (up to 3, configurable) upstream/downstream walk of everything
+  that node touches or is touched by, each result tagged with hop count and
+  its own debt score. Same query is available via `GET /api/blast-radius`
+  and the MCP server's `get_blast_radius` tool.
+* **Trend history across analysis runs** — every run now appends to
+  `analysis_runs`/`node_debt_history` in `app.db` instead of overwriting the
+  last one. `GET /api/runs` lists every past run; `GET /api/trend?node_id=…`
+  charts one file/table's debt score over time (shown as a sparkline in its
+  detail panel once at least 2 runs exist).
+* **PR-history mining** (`backend/pr_context.py`) — detects a repo's
+  GitHub/GitLab.com origin remote, pulls its recently merged PRs/MRs, and
+  asks the configured AI provider to extract durable per-file gotchas
+  (invariants, required migration steps, footguns) — surfaced in that
+  file's detail panel and via `GET /api/pr-insights`. Opt-in per repo, from
+  Admin ("PR-history mining") — never runs automatically during analysis.
+* **AI module/architecture narratives** (`backend/module_narrative.py`) —
+  the new **Architecture** tab groups files into modules (one folder level
+  under each repo root), and on demand asks the configured AI provider to
+  describe each module's role, responsibilities, key files, and debt
+  concerns, grounded in real metrics and source excerpts. Cached per module
+  by a content hash, so it only regenerates when that module's files or
+  metrics actually change.
 
 ## Debt score, in full
 
@@ -159,7 +204,41 @@ score calculated?" on any file or table's detail panel.
   by an in-memory map rebuilt on every analysis** — restarting the backend
   without re-running an analysis means recommendations fall back to
   metrics-only until the next run.
-* **No trend history** — each analysis run overwrites the last.
+* **Coupling detection is a regex heuristic, not dataflow analysis.** It
+  looks for known messaging/cache library signatures and literal
+  queue/topic/channel names (or well-known connection env-var names) in raw
+  source text. It will miss couplings built from a runtime variable or a
+  constant imported from a third file, and a key name reused by coincidence
+  (not an actual shared resource) can produce a false edge — treat these as
+  leads to verify, not certainties, same as the rest of this app's static
+  analysis. It works identically across every analyzed language (Python,
+  .NET, TypeScript) since it runs over already-collected raw source text
+  rather than a language-specific AST.
+* **PR mining supports GitHub and GitLab.com only** — detected from the
+  repo's local `origin` remote. Self-hosted GitLab/Gitea/Bitbucket/etc.
+  aren't supported yet; mining reports this plainly rather than silently
+  finding nothing. It's also unauthenticated by default (fine for a public
+  repo's recent history) — add a token in Admin for a private repo or to
+  raise the rate limit.
+* **Module grouping is a folder-depth heuristic**
+  (`backend/module_narrative.py`), not a real architecture boundary — it
+  groups by the first two path segments under each repo root. A repo with
+  many top-level files will show several one-file "modules"; a repo with a
+  flat structure may group more coarsely than its actual subsystems.
+* **This pass deliberately didn't touch the .NET (Roslyn) or TypeScript
+  analyzer tools.** All six additions above are pure Python-backend +
+  React-frontend work operating on data every analyzer already produces
+  (`source_text`, `edges`, `dashboard_data.json`) — none of them required
+  changing `dotnet_tools/CodeMetrics` or `ts_tools/CodeMetrics`. That was a
+  deliberate choice for this pass (not just a workaround): a full
+  cross-language symbol-level catalog/call-graph — richer than the current
+  file-level import graph — would need real per-language work in both of
+  those tools and was scoped out; the six features above were judged to
+  deliver most of the value without it.
+* **No trend history before this version's first run.** Every run now
+  appends to `analysis_runs`/`node_debt_history` going forward, but there's
+  nothing to chart for a file until you've run at least 2 analyses since
+  upgrading.
 * **The feedback loop is in-context, not gradient-based.** If you want actual
 prompt/weight optimization from accumulated feedback (e.g. a DSPy-style
 optimizer), that's a real additional build, not something to assume is

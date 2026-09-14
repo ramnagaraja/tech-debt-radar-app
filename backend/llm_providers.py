@@ -8,6 +8,7 @@ Real endpoints (verified against each vendor's current docs, not guessed):
   - Gemini:    https://generativelanguage.googleapis.com/v1beta/openai/  (model e.g. gemini-3.5-flash)
   - Ollama:    http://localhost:11434/v1 by default (local, no API key)  (model e.g. qwen2.5, llama3.1)
 """
+import json
 PROVIDERS = {
     "anthropic": {"label": "Claude (Anthropic)", "default_model": "claude-sonnet-5"},
     "gemini": {"label": "Gemini (Google)", "default_model": "gemini-3.5-flash"},
@@ -15,6 +16,41 @@ PROVIDERS = {
 }
 
 DEFAULT_OLLAMA_BASE_URL = "http://localhost:11434/v1"
+
+
+def extract_json(text, expect="object"):
+    """Pulls the first well-formed JSON object/array out of an LLM response
+    that was asked for "strict JSON" but may still have wrapped it in a
+    sentence ("Here's the analysis: {...}") or a ```json fence. Deliberately
+    NOT a `re.search(r"\\{.*\\}", text, re.DOTALL)` (this module's earlier
+    approach): that greedy regex spans from the first opening brace to the
+    LAST closing brace anywhere in the text, so any unrelated brace/bracket
+    in surrounding prose (e.g. "the handler({...}) callback") silently pulls
+    extra, non-JSON text into the "match" — which then fails to parse with a
+    confusing error like "Unterminated string", not a helpful one.
+
+    Instead, this tries the stdlib JSON parser's own `raw_decode` (real
+    bracket-matching, not regex) at every occurrence of the opener character
+    in turn, returning the first one that actually parses as valid JSON. A
+    single `raw_decode` from the first opener isn't enough on its own: if
+    the model's lead-in prose itself contains a stray "{" or "[" before the
+    real JSON (e.g. "the handler({raw}) callback"), decoding would start —
+    and fail — right there. Trying each candidate start in order correctly
+    skips past those and finds the real value, wherever it starts."""
+    opener = "{" if expect == "object" else "["
+    decoder = json.JSONDecoder()
+    search_from = 0
+    while True:
+        idx = text.find(opener, search_from)
+        if idx == -1:
+            break
+        try:
+            value, _ = decoder.raw_decode(text, idx)
+            return value
+        except json.JSONDecodeError:
+            search_from = idx + 1
+    kind = "object" if expect == "object" else "array"
+    raise ValueError(f"No JSON {kind} found in the model's response.")
 
 
 def call_llm(provider, model, api_key, system, messages, max_tokens=1000, base_url=None):

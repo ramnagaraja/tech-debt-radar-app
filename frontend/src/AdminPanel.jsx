@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from "react";
-import { Settings, Key, Check, X, Loader2, ThumbsUp, ThumbsDown, Upload, FileText, Trash2, AlertCircle } from "lucide-react";
+import { Settings, Key, Check, X, Loader2, ThumbsUp, ThumbsDown, Upload, FileText, Trash2, AlertCircle, GitPullRequestArrow, ShieldCheck, Terminal } from "lucide-react";
 
 const PROVIDER_ORDER = ["anthropic", "gemini", "ollama"];
 const PROVIDER_NOTES = {
@@ -12,11 +12,15 @@ export default function AdminPanel({ onClose }) {
   const [settings, setSettings] = useState(null);
   const [form, setForm] = useState({}); // { [provider]: { model, api_key } }
   const [atlassianForm, setAtlassianForm] = useState({ email: "", api_token: "" });
+  const [gitTokenForm, setGitTokenForm] = useState({ github_token: "", gitlab_token: "" });
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
   const [stats, setStats] = useState(null);
   const [kbDocs, setKbDocs] = useState([]);
   const [kbUploading, setKbUploading] = useState(false);
+  const [repos, setRepos] = useState([]); // from the last analysis run — [{slug, name}]
+  const [miningStatus, setMiningStatus] = useState({}); // { [slug]: {status, error} }
+  const [annotations, setAnnotations] = useState([]);
   const fileInputRef = useRef(null);
 
   useEffect(() => {
@@ -26,10 +30,32 @@ export default function AdminPanel({ onClose }) {
       for (const p of PROVIDER_ORDER) f[p] = { model: s.providers[p]?.model || "", api_key: "", base_url: s.providers[p]?.base_url || "" };
       setForm(f);
       setAtlassianForm({ email: s.atlassian?.email || "", api_token: "" });
+      setGitTokenForm({ github_token: "", gitlab_token: "" });
     });
     fetch("/api/feedback/stats").then((r) => r.json()).then(setStats).catch(() => {});
     refreshKbDocs();
+    fetch("/api/metrics").then((r) => r.json()).then((d) => { if (d.ready) setRepos(d.repos || []); }).catch(() => {});
+    refreshAnnotations();
   }, []);
+
+  function refreshAnnotations() {
+    fetch("/api/annotations?status=pending").then((r) => r.json()).then((d) => setAnnotations(d.items || [])).catch(() => {});
+  }
+
+  async function decideAnnotation(id, decision) {
+    await fetch(`/api/annotations/${id}/${decision}`, { method: "POST" });
+    refreshAnnotations();
+  }
+
+  async function minePrHistory(slug) {
+    setMiningStatus((m) => ({ ...m, [slug]: { status: "running", error: null } }));
+    await fetch("/api/pr-insights/mine", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ repo_slug: slug }) });
+    const poll = setInterval(async () => {
+      const s = await fetch(`/api/pr-insights/status?repo_slug=${encodeURIComponent(slug)}`).then((r) => r.json());
+      setMiningStatus((m) => ({ ...m, [slug]: s }));
+      if (s.status === "done" || s.status === "error") clearInterval(poll);
+    }, 2000);
+  }
 
   function refreshKbDocs() {
     fetch("/api/knowledge/documents").then((r) => r.json()).then((d) => setKbDocs(d.documents || [])).catch(() => {});
@@ -69,6 +95,8 @@ export default function AdminPanel({ onClose }) {
       active_provider: settings.active_provider,
       atlassian_email: atlassianForm.email,
       atlassian_api_token: atlassianForm.api_token || undefined,
+      github_token: gitTokenForm.github_token || undefined,
+      gitlab_token: gitTokenForm.gitlab_token || undefined,
     };
     for (const p of PROVIDER_ORDER) {
       body[`${p}_model`] = form[p]?.model || undefined;
@@ -83,6 +111,7 @@ export default function AdminPanel({ onClose }) {
       for (const p of PROVIDER_ORDER) f[p] = { model: fresh.providers[p]?.model || "", api_key: "", base_url: fresh.providers[p]?.base_url || "" };
       setForm(f);
       setAtlassianForm({ email: fresh.atlassian?.email || "", api_token: "" });
+      setGitTokenForm({ github_token: "", gitlab_token: "" });
       setSaved(true);
       setTimeout(() => setSaved(false), 2500);
     }
@@ -170,6 +199,87 @@ export default function AdminPanel({ onClose }) {
               )}
             </div>
           ))}
+        </div>
+
+        <div style={{ border: "1px solid #E1EBF5", borderRadius: 10, padding: 14, marginBottom: 16 }}>
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 6 }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 13.5, fontWeight: 700, color: "#0F2540" }}>
+              <GitPullRequestArrow size={14} /> PR-history mining
+            </div>
+          </div>
+          <p style={{ fontSize: 11, color: "#7B8FA8", margin: "0 0 8px" }}>
+            Optional tokens for GitHub/GitLab.com — raises the API rate limit and unlocks private repos. Leave blank to mine public repos at the unauthenticated rate limit (usually enough for a single repo's recent history).
+          </p>
+          <div style={{ display: "flex", gap: 8, marginBottom: 10 }}>
+            <div style={{ flex: 1, position: "relative" }}>
+              <Key size={12} style={{ position: "absolute", left: 9, top: 9, color: "#B7CDE3" }} />
+              <input type="password" value={gitTokenForm.github_token} onChange={(e) => setGitTokenForm((f) => ({ ...f, github_token: e.target.value }))}
+                placeholder={settings.pr_mining?.github_has_token ? `leave blank to keep existing (${settings.pr_mining.github_token_preview})` : "GitHub token (optional)"}
+                style={{ width: "100%", boxSizing: "border-box", padding: "7px 10px 7px 26px", borderRadius: 7, border: "1px solid #DCEAF6", fontSize: 12 }} />
+            </div>
+            <div style={{ flex: 1, position: "relative" }}>
+              <Key size={12} style={{ position: "absolute", left: 9, top: 9, color: "#B7CDE3" }} />
+              <input type="password" value={gitTokenForm.gitlab_token} onChange={(e) => setGitTokenForm((f) => ({ ...f, gitlab_token: e.target.value }))}
+                placeholder={settings.pr_mining?.gitlab_has_token ? `leave blank to keep existing (${settings.pr_mining.gitlab_token_preview})` : "GitLab token (optional)"}
+                style={{ width: "100%", boxSizing: "border-box", padding: "7px 10px 7px 26px", borderRadius: 7, border: "1px solid #DCEAF6", fontSize: 12 }} />
+            </div>
+          </div>
+          {repos.length === 0 ? (
+            <p style={{ fontSize: 11, color: "#93A7BF", margin: 0 }}>Run an analysis first — mining works against the repo(s) from your last run.</p>
+          ) : (
+            repos.map((r) => {
+              const st = miningStatus[r.slug];
+              return (
+                <div key={r.slug} style={{ display: "flex", alignItems: "center", gap: 8, padding: "6px 0", borderTop: "1px solid #F0F4F9" }}>
+                  <span style={{ flex: 1, fontSize: 12, color: "#0F2540", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{r.name}</span>
+                  {st?.status === "running" && <span style={{ display: "flex", alignItems: "center", gap: 4, fontSize: 10.5, color: "#B45309" }}><Loader2 size={11} className="spin" /> mining…</span>}
+                  {st?.status === "done" && <span style={{ fontSize: 10.5, color: "#0F7B4E" }}>done</span>}
+                  {st?.status === "error" && <span title={st.error} style={{ fontSize: 10.5, color: "#B91C1C" }}>failed — {st.error}</span>}
+                  <button onClick={() => minePrHistory(r.slug)} disabled={st?.status === "running"}
+                    style={{ fontSize: 11, fontWeight: 600, padding: "5px 10px", borderRadius: 7, border: "1px solid #CDE9FB", background: "#FFFFFF", color: "#0369A1", cursor: st?.status === "running" ? "default" : "pointer", opacity: st?.status === "running" ? 0.6 : 1 }}>
+                    Mine PR history
+                  </button>
+                </div>
+              );
+            })
+          )}
+        </div>
+
+        {annotations.length > 0 && (
+          <div style={{ border: "1px solid #E1EBF5", borderRadius: 10, padding: 14, marginBottom: 16 }}>
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 6 }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 13.5, fontWeight: 700, color: "#0F2540" }}>
+                <ShieldCheck size={14} /> Pending annotations
+              </div>
+              <span style={{ fontSize: 11, color: "#5B7290", background: "#F3F8FD", padding: "2px 8px", borderRadius: 99 }}>{annotations.length}</span>
+            </div>
+            <p style={{ fontSize: 11, color: "#7B8FA8", margin: "0 0 8px" }}>
+              Notes proposed by an MCP client (Claude Code, Cursor, etc.) via the <code>annotate_node</code> tool. Nothing changes on the graph until you approve one.
+            </p>
+            {annotations.map((a) => (
+              <div key={a.id} style={{ padding: "8px 0", borderTop: "1px solid #F0F4F9" }}>
+                <div style={{ fontSize: 11.5, fontFamily: "'IBM Plex Mono', monospace", color: "#0F2540", marginBottom: 3 }}>{a.node_id}</div>
+                <div style={{ fontSize: 12, color: "#3A4E68", marginBottom: 6 }}>{a.note}</div>
+                <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                  <span style={{ fontSize: 10, color: "#93A7BF", flex: 1 }}>proposed by {a.author}</span>
+                  <button onClick={() => decideAnnotation(a.id, "approve")} style={{ fontSize: 11, fontWeight: 600, padding: "4px 9px", borderRadius: 6, border: "none", background: "#0F7B4E", color: "white", cursor: "pointer" }}>Approve</button>
+                  <button onClick={() => decideAnnotation(a.id, "reject")} style={{ fontSize: 11, fontWeight: 600, padding: "4px 9px", borderRadius: 6, border: "1px solid #E1EBF5", background: "#FFFFFF", color: "#5B7290", cursor: "pointer" }}>Reject</button>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+
+        <div style={{ border: "1px solid #E1EBF5", borderRadius: 10, padding: 14, marginBottom: 16, background: "#FBFDFF" }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 13.5, fontWeight: 700, color: "#0F2540", marginBottom: 6 }}>
+            <Terminal size={14} /> MCP server (Claude Code / Cursor / etc.)
+          </div>
+          <p style={{ fontSize: 11, color: "#7B8FA8", margin: "0 0 6px" }}>
+            This app ships <code>backend/mcp_server.py</code>, a standalone MCP server exposing the last analysis run (debt summary, module narratives, blast-radius queries, PR insights, and a grounded Q&amp;A tool) to any MCP-speaking agent — it reads the same on-disk data this dashboard does and doesn't require this web server to be running.
+          </p>
+          <p style={{ fontSize: 11, color: "#7B8FA8", margin: 0 }}>
+            Point your MCP client at <code>python3 backend/mcp_server.py</code> over stdio. Its one write tool, <code>annotate_node</code>, only ever proposes a note here for you to approve — see "Pending annotations" above.
+          </p>
         </div>
 
         {PROVIDER_ORDER.map((p) => {

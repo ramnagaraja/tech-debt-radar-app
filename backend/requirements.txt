@@ -15,3 +15,4 @@ pypdf
 python-docx
 numpy
 python-multipart
+mcp>=2.0
