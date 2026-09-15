@@ -27,13 +27,24 @@ MAX_EXCERPT_FILES = 5     # highest-debt files a source excerpt is pulled from
 
 NARRATIVE_SYSTEM_PROMPT = (
     "You are writing a short architecture narrative for one module (folder) of a "
-    "codebase, for an engineer who has never seen this code before. You are given "
-    "the module's file list with debt metrics, and short source excerpts from its "
-    "highest-debt files. Respond with ONLY strict JSON, no prose before or after: "
+    "codebase, for an engineer who has never seen this code before AND for a tech "
+    "lead deciding what to fix first. You are given the module's file list with "
+    "debt metrics (including, for the highest-debt files, a breakdown by score "
+    "component, security findings, and any flow/concurrency-risk findings), and "
+    "short source excerpts from its highest-debt files. Respond with ONLY strict "
+    "JSON, no prose before or after: "
     '{"role": "one sentence - what this module appears to be for", '
     '"responsibilities": ["short bullet", "..."], '
-    '"key_files": ["path - why it matters", "..."], '
-    '"concerns": ["specific debt/design concern grounded in the metrics or excerpts shown", "..."]}. '
+    '"key_files": ["path - why it matters for understanding this module", "..."], '
+    '"concerns": ["specific debt/design concern grounded in the metrics or excerpts shown", "..."], '
+    '"priority_files": [{"file": "path", "reason": "the SPECIFIC metric(s)/finding(s) driving urgency - cite the actual score component, security finding, or flow risk, never a generic phrase like \'high complexity\'", "recommendation": "one concrete, specific next action for this exact file"}, "..."], '
+    '"recommendations": ["short, prioritized, module-level action - most impactful first, each specific enough to hand directly to an engineer", "..."]}. '
+    "priority_files is a RANKED list (most urgent first, at most 5) of the files in "
+    "THIS module that most need immediate attention - rank by actual severity across "
+    "all the signal given (debt score AND its breakdown, security findings, flow/"
+    "concurrency risks, duplicate/god-file flags), not just raw debt score. Every "
+    "reason and recommendation must be pointed and specific to that file's own "
+    "metrics/excerpt, never a generic restatement like 'refactor for maintainability'. "
     "Ground every claim in the file list, metrics, or excerpts given - never invent "
     "a file name, framework, or behavior that wasn't shown to you. If the excerpts "
     "don't support a confident concern, say so briefly (e.g. \"no excerpt available "
@@ -70,11 +81,21 @@ def group_into_modules(files, repo_slugs):
 
 
 def content_hash(file_list):
-    """Stable hash over (file, debt_score, loc) — changes whenever this
-    module's composition or metrics change, not on every analysis run of an
-    unrelated module, so a cached narrative survives re-analyses that don't
-    touch this module."""
-    basis = sorted((f["file"], round(f.get("debt_score", 0) or 0, 4), f.get("loc", 0)) for f in file_list)
+    """Stable hash over (file, debt_score, loc, security_issue_count,
+    flow_risk_count) — changes whenever this module's composition or metrics
+    change, not on every analysis run of an unrelated module, so a cached
+    narrative survives re-analyses that don't touch this module.
+    security_issue_count and flow_risk_count are included alongside
+    debt_score because flow-risk findings (flow_risk_analyzer's concurrency/
+    edge-case scan) aren't themselves a debt-score input — a file's flow
+    risks can change between runs with its debt_score staying identical, and
+    the priority_files/recommendations fields below are meant to reflect
+    exactly that signal, so a change there must still invalidate the cache."""
+    basis = sorted(
+        (f["file"], round(f.get("debt_score", 0) or 0, 4), f.get("loc", 0),
+         f.get("security_issue_count", 0) or 0, len(f.get("flow_risks") or []))
+        for f in file_list
+    )
     return hashlib.sha256(json.dumps(basis).encode()).hexdigest()[:16]
 
 
@@ -98,9 +119,35 @@ def generate_narrative(module_id, file_list, source_text, provider, model, api_k
     never raises, so one module's narrative failure never blocks the rest."""
     by_debt = sorted(file_list, key=lambda f: f.get("debt_score", 0) or 0, reverse=True)
     listed = by_debt[:MAX_FILES_LISTED]
-    file_lines = "\n".join(
-        f"- {f['file']} (debt {f.get('debt_score', 0) or 0:.2f}, loc {f.get('loc', 0) or 0})" for f in listed
-    )
+
+    def _file_line(f, detailed):
+        base = f"- {f['file']} (debt {f.get('debt_score', 0) or 0:.2f}, loc {f.get('loc', 0) or 0})"
+        if not detailed:
+            return base
+        # Detailed grounding for the files priority_files is actually asked to
+        # rank — the score breakdown and specific findings behind the number,
+        # not just the number itself, so a "reason" in the model's response
+        # can cite something real instead of restating the debt score in words.
+        extra = []
+        bd = f.get("score_breakdown") or {}
+        if bd:
+            extra.append(f"breakdown: complexity={bd.get('complexity')} churn={bd.get('churn')} security={bd.get('security')} design={bd.get('design')}")
+        if f.get("security_issue_count"):
+            top_sec = (f.get("security_issues") or [])[:3]
+            extra.append(f"security: {f['security_issue_count']} finding(s) ({f.get('security_high_count', 0)} high)" + (
+                " - " + "; ".join(f"[{s.get('severity')}] {s.get('test_id')}: {s.get('text')}" for s in top_sec) if top_sec else ""
+            ))
+        if f.get("flow_risks"):
+            extra.append(f"flow risks: {len(f['flow_risks'])} - " + "; ".join(r.get("label", "") for r in f["flow_risks"][:3]))
+        if f.get("god_file"):
+            extra.append("flagged as a god file (too many responsibilities)")
+        if f.get("duplicate_function_count"):
+            extra.append(f"{f['duplicate_function_count']} duplicate/near-duplicate function(s)")
+        if f.get("long_conditional_chain_count"):
+            extra.append(f"{f['long_conditional_chain_count']} long if/switch chain(s)")
+        return base + (" | " + " | ".join(extra) if extra else "")
+
+    file_lines = "\n".join(_file_line(f, i < MAX_EXCERPT_FILES) for i, f in enumerate(listed))
     if len(file_list) > len(listed):
         file_lines += f"\n… and {len(file_list) - len(listed)} more file(s) in this module."
 
@@ -119,14 +166,39 @@ def generate_narrative(module_id, file_list, source_text, provider, model, api_k
         f"Files ({len(file_list)} total, {len(listed)} shown):\n{file_lines}\n\n"
         f"Source excerpts from the highest-debt files:\n\n" + ("\n\n".join(excerpts) if excerpts else "(no source available for excerpting)")
     )
-    try:
-        text = llm_providers.call_llm(
-            provider, model, api_key, NARRATIVE_SYSTEM_PROMPT,
-            [{"role": "user", "content": user_content}], max_tokens=1800, base_url=base_url,
+    # One retry with a blunter "JSON only" instruction before giving up — a
+    # model given a large prompt (many files/excerpts, as a big module
+    # produces) occasionally answers with prose/caveats instead of the
+    # requested JSON on the first try even though the system prompt already
+    # asked for strict JSON. The retry costs one extra call only when the
+    # first one didn't parse; a clean first response never triggers it.
+    last_error, last_text = None, ""
+    for attempt in range(2):
+        prompt = user_content if attempt == 0 else (
+            user_content + "\n\nYour previous response did not contain a JSON object. "
+            "Respond with ONLY the JSON object this time — no markdown code fence, no "
+            "explanation before or after it, no caveats. Start your reply with { and end it with }."
         )
-        narrative = llm_providers.extract_json(text, expect="object")
-        for key in ("role", "responsibilities", "key_files", "concerns"):
-            narrative.setdefault(key, [] if key != "role" else "")
-        return {"ok": True, "narrative": narrative}
-    except Exception as e:
-        return {"ok": False, "error": f"Could not generate narrative: {e}"}
+        try:
+            text = llm_providers.call_llm(
+                provider, model, api_key, NARRATIVE_SYSTEM_PROMPT,
+                [{"role": "user", "content": prompt}], max_tokens=2600, base_url=base_url, json_mode=True,
+            )
+            last_text = text
+            narrative = llm_providers.extract_json(text, expect="object")
+            for key in ("role", "responsibilities", "key_files", "concerns", "priority_files", "recommendations"):
+                narrative.setdefault(key, [] if key != "role" else "")
+            # max_tokens raised alongside these two new fields below — a
+            # module with several high-debt files asked for detailed,
+            # specific per-file reasons/recommendations can genuinely need
+            # more room than the four-field version of this response did.
+            return {"ok": True, "narrative": narrative}
+        except Exception as e:
+            last_error = e
+
+    # Both attempts failed — include what the model actually said (not just
+    # the parser's complaint) so this is diagnosable from the error alone
+    # rather than a bare "No JSON object found."
+    preview = (last_text or "").strip().replace("\n", " ")[:220]
+    detail = f' The model\'s last response started: "{preview}{"…" if len(last_text.strip()) > 220 else ""}"' if preview else " The model's last response was empty."
+    return {"ok": False, "error": f"Could not generate narrative after 2 attempts ({last_error}).{detail}"}

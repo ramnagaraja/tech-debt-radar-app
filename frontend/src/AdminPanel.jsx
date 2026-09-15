@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from "react";
-import { Settings, Key, Check, X, Loader2, ThumbsUp, ThumbsDown, Upload, FileText, Trash2, AlertCircle, GitPullRequestArrow, ShieldCheck, Terminal } from "lucide-react";
+import { Settings, Key, Check, X, Loader2, ThumbsUp, ThumbsDown, Upload, FileText, Trash2, AlertCircle, GitPullRequestArrow, ShieldCheck, Terminal, History, MessageCircle, Sparkles } from "lucide-react";
 
 const PROVIDER_ORDER = ["anthropic", "gemini", "ollama"];
 const PROVIDER_NOTES = {
@@ -7,6 +7,29 @@ const PROVIDER_NOTES = {
   gemini: "Via Gemini's OpenAI-compatible endpoint.",
   ollama: "Runs fully on this machine via Ollama — zero per-call token cost, no data leaves this host. Needs `ollama serve` running and the model already pulled (e.g. `ollama pull qwen2.5`).",
 };
+
+function ExchangeList({ items, loading }) {
+  if (loading) return <div style={{ fontSize: 11.5, color: "#93A7BF", padding: "8px 0" }}>Loading…</div>;
+  if (!items.length) return <div style={{ fontSize: 11.5, color: "#93A7BF", padding: "8px 0" }}>No chat or recommendation activity logged for this run.</div>;
+  return (
+    <div style={{ maxHeight: 260, overflowY: "auto" }}>
+      {items.map((it) => (
+        <div key={it.id} style={{ padding: "7px 2px", borderTop: "1px solid #F0F4F9" }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 3 }}>
+            {it.kind === "recommendation" ? <Sparkles size={11} color="#0369A1" /> : <MessageCircle size={11} color="#5B3FA8" />}
+            <span style={{ fontSize: 9.5, fontWeight: 700, color: it.kind === "recommendation" ? "#0369A1" : "#5B3FA8", background: it.kind === "recommendation" ? "#E7F4FE" : "#F1ECFB", padding: "1px 6px", borderRadius: 99 }}>
+              {it.kind === "recommendation" ? "Recommendation" : "Ask"}
+            </span>
+            {it.node_id && <span style={{ fontSize: 10, fontFamily: "'IBM Plex Mono', monospace", color: "#7B8FA8" }}>{it.node_id}</span>}
+            <span style={{ fontSize: 9.5, color: "#B7C4D6", marginLeft: "auto" }}>{new Date(it.created_at).toLocaleString()}</span>
+          </div>
+          <div style={{ fontSize: 11.5, color: "#0F2540", fontWeight: 600, marginBottom: 2, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{it.question}</div>
+          <div style={{ fontSize: 11, color: "#5B7290", display: "-webkit-box", WebkitLineClamp: 2, WebkitBoxOrient: "vertical", overflow: "hidden" }}>{it.answer}</div>
+        </div>
+      ))}
+    </div>
+  );
+}
 
 export default function AdminPanel({ onClose }) {
   const [settings, setSettings] = useState(null);
@@ -21,6 +44,13 @@ export default function AdminPanel({ onClose }) {
   const [repos, setRepos] = useState([]); // from the last analysis run — [{slug, name}]
   const [miningStatus, setMiningStatus] = useState({}); // { [slug]: {status, error} }
   const [annotations, setAnnotations] = useState([]);
+  const [runs, setRuns] = useState([]);
+  const [selectedRunA, setSelectedRunA] = useState(null);
+  const [selectedRunB, setSelectedRunB] = useState(null);
+  const [compareMode, setCompareMode] = useState(false);
+  const [historyA, setHistoryA] = useState([]);
+  const [historyB, setHistoryB] = useState([]);
+  const [historyLoading, setHistoryLoading] = useState(false);
   const fileInputRef = useRef(null);
 
   useEffect(() => {
@@ -36,7 +66,28 @@ export default function AdminPanel({ onClose }) {
     refreshKbDocs();
     fetch("/api/metrics").then((r) => r.json()).then((d) => { if (d.ready) setRepos(d.repos || []); }).catch(() => {});
     refreshAnnotations();
+    fetch("/api/runs?limit=50").then((r) => r.json()).then((d) => {
+      const list = d.runs || [];
+      setRuns(list);
+      if (list.length) {
+        setSelectedRunA(list[list.length - 1].run_id);           // most recent
+        if (list.length > 1) setSelectedRunB(list[list.length - 2].run_id); // one before it
+      }
+    }).catch(() => {});
   }, []);
+
+  useEffect(() => {
+    if (selectedRunA == null) { setHistoryA([]); return; }
+    setHistoryLoading(true);
+    fetch(`/api/chat-history?run_id=${selectedRunA}&limit=100`).then((r) => r.json())
+      .then((d) => setHistoryA(d.items || [])).catch(() => setHistoryA([])).finally(() => setHistoryLoading(false));
+  }, [selectedRunA]);
+
+  useEffect(() => {
+    if (!compareMode || selectedRunB == null) { setHistoryB([]); return; }
+    fetch(`/api/chat-history?run_id=${selectedRunB}&limit=100`).then((r) => r.json())
+      .then((d) => setHistoryB(d.items || [])).catch(() => setHistoryB([]));
+  }, [compareMode, selectedRunB]);
 
   function refreshAnnotations() {
     fetch("/api/annotations?status=pending").then((r) => r.json()).then((d) => setAnnotations(d.items || [])).catch(() => {});
@@ -122,7 +173,7 @@ export default function AdminPanel({ onClose }) {
 
   return (
     <div style={{ position: "fixed", inset: 0, background: "rgba(15,37,64,0.35)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 100, padding: 20 }}>
-      <div style={{ width: 560, maxHeight: "88vh", overflowY: "auto", background: "#FFFFFF", borderRadius: 14, padding: 26, boxShadow: "0 24px 60px rgba(15,37,64,0.3)" }}>
+      <div style={{ width: compareMode ? 780 : 560, maxWidth: "94vw", maxHeight: "88vh", overflowY: "auto", background: "#FFFFFF", borderRadius: 14, padding: 26, boxShadow: "0 24px 60px rgba(15,37,64,0.3)", transition: "width 0.15s ease" }}>
         <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 6 }}>
           <div style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 16, fontWeight: 700, color: "#0F2540" }}>
             <Settings size={17} /> Admin settings
@@ -169,7 +220,7 @@ export default function AdminPanel({ onClose }) {
             <span style={{ fontSize: 11, color: "#5B7290", background: "#F3F8FD", padding: "2px 8px", borderRadius: 99 }}>{kbDocs.length} doc{kbDocs.length === 1 ? "" : "s"}</span>
           </div>
           <p style={{ fontSize: 11, color: "#7B8FA8", margin: "0 0 8px" }}>
-            Upload PDF/DOCX/Markdown/text standards, runbooks, or architecture docs. The Ask tab and recommendations retrieve and cite relevant passages, with a real (embedding-similarity) confidence score — not just the model's own self-assessment. Embeddings run locally (fastembed) — no API key, nothing leaves this machine. Three built-in references (SOLID principles, design patterns, microservices architecture) are bundled by default, marked "Built-in" below.
+            Upload PDF/DOCX/Markdown/text standards, runbooks, or architecture docs. The Ask tab and recommendations retrieve and cite relevant passages, with a real (embedding-similarity) confidence score — not just the model's own self-assessment. Embeddings run locally (fastembed) — no API key, nothing leaves this machine. Six built-in references (SOLID principles, the full Gang-of-Four design pattern catalog, microservices architecture, API design best practices, integration patterns, and frontend best practices) are bundled by default, marked "Built-in" below.
           </p>
           <input ref={fileInputRef} type="file" accept=".pdf,.docx,.md,.txt" style={{ display: "none" }}
             onChange={(e) => uploadKbFile(e.target.files[0])} />
@@ -189,7 +240,7 @@ export default function AdminPanel({ onClose }) {
                 </span>
               )}
               {doc.is_builtin ? (
-                <span title="Bundled with the app — SOLID / design patterns / microservices reference library" style={{ fontSize: 9.5, fontWeight: 700, color: "#5B3FA8", background: "#F1ECFB", padding: "1px 6px", borderRadius: 99, flexShrink: 0 }}>
+                <span title="Bundled with the app — SOLID, GoF design patterns, microservices, API design, integration patterns, and frontend best practices" style={{ fontSize: 9.5, fontWeight: 700, color: "#5B3FA8", background: "#F1ECFB", padding: "1px 6px", borderRadius: 99, flexShrink: 0 }}>
                   Built-in
                 </span>
               ) : (
@@ -244,6 +295,45 @@ export default function AdminPanel({ onClose }) {
             })
           )}
         </div>
+
+        {runs.length > 0 && (
+          <div style={{ border: "1px solid #E1EBF5", borderRadius: 10, padding: 14, marginBottom: 16 }}>
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 6, flexWrap: "wrap", gap: 6 }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 13.5, fontWeight: 700, color: "#0F2540" }}>
+                <History size={14} /> Run history — Ask &amp; recommendation log
+              </div>
+              <button onClick={() => setCompareMode((v) => !v)}
+                style={{ fontSize: 10.5, fontWeight: 600, padding: "3px 9px", borderRadius: 99, border: compareMode ? "1.5px solid #0EA5E9" : "1px solid #DCEAF6", background: compareMode ? "#E7F4FE" : "#FFFFFF", color: compareMode ? "#0369A1" : "#5B7290", cursor: "pointer" }}>
+                {compareMode ? "Comparing two runs" : "Compare two runs"}
+              </button>
+            </div>
+            <p style={{ fontSize: 11, color: "#7B8FA8", margin: "0 0 8px" }}>
+              Every Ask-tab question and every "Get recommendations" call is logged automatically, tagged with the analysis run it happened under — pick a run to see what was asked and answered, or compare two runs side by side as the codebase (and its debt) changes.
+            </p>
+            <div style={{ display: "flex", gap: 10 }}>
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <select value={selectedRunA ?? ""} onChange={(e) => setSelectedRunA(Number(e.target.value))}
+                  style={{ width: "100%", boxSizing: "border-box", padding: "6px 8px", borderRadius: 7, border: "1px solid #DCEAF6", fontSize: 11.5, marginBottom: 8, background: "#FFFFFF" }}>
+                  {[...runs].reverse().map((r) => (
+                    <option key={r.run_id} value={r.run_id}>Run #{r.run_id} — {new Date(r.generated_at).toLocaleString()} ({r.repo_label})</option>
+                  ))}
+                </select>
+                <ExchangeList items={historyA} loading={historyLoading} />
+              </div>
+              {compareMode && (
+                <div style={{ flex: 1, minWidth: 0, borderLeft: "1px solid #F0F4F9", paddingLeft: 10 }}>
+                  <select value={selectedRunB ?? ""} onChange={(e) => setSelectedRunB(Number(e.target.value))}
+                    style={{ width: "100%", boxSizing: "border-box", padding: "6px 8px", borderRadius: 7, border: "1px solid #DCEAF6", fontSize: 11.5, marginBottom: 8, background: "#FFFFFF" }}>
+                    {[...runs].reverse().map((r) => (
+                      <option key={r.run_id} value={r.run_id}>Run #{r.run_id} — {new Date(r.generated_at).toLocaleString()} ({r.repo_label})</option>
+                    ))}
+                  </select>
+                  <ExchangeList items={historyB} loading={false} />
+                </div>
+              )}
+            </div>
+          </div>
+        )}
 
         {annotations.length > 0 && (
           <div style={{ border: "1px solid #E1EBF5", borderRadius: 10, padding: 14, marginBottom: 16 }}>

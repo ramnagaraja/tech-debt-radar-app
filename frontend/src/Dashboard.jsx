@@ -7,7 +7,7 @@ import remarkGfm from "remark-gfm";
 import {
   Flame, GitBranch, MessageCircle, Database, ThumbsUp, ThumbsDown, Search, ArrowRight,
   Clock, Send, RefreshCw, Info, Sparkles, ShieldAlert, X, Settings, AlertTriangle, Palette, FileText, Workflow,
-  Check, Loader2, TrendingUp, GitPullRequestArrow, Boxes, RotateCw,
+  Check, Loader2, TrendingUp, GitPullRequestArrow, Boxes, RotateCw, ClipboardList,
 } from "lucide-react";
 import AdminPanel from "./AdminPanel.jsx";
 import { STEP_LABELS } from "./SetupScreen.jsx";
@@ -529,26 +529,62 @@ async function searchKnowledgeBase(query, topK = 4) {
   }
 }
 
+// Fire-and-forget: every Ask-tab answer and every "Get recommendations" call
+// gets logged here, tagged with the run_id current when it happened (data.run_id,
+// stamped onto the metrics payload by run_analysis()/record_run_history() —
+// undefined/null for data loaded before this run-tagging existed, or if no
+// analysis has ever been run, which the backend accepts fine). This is what
+// backs the Admin panel's "Run history" comparison view — never awaited by a
+// caller, and never allowed to interrupt the chat/recommendation flow it
+// rides along with if the log write itself fails.
+function logChatExchange({ runId, kind, nodeId, question, answer, kbQuery, sources }) {
+  fetch("/api/chat-history", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      run_id: runId ?? null, kind, node_id: nodeId ?? null, question, answer,
+      kb_query: kbQuery ?? null, sources: (sources || []).map((s) => s.chunk_id ?? s),
+    }),
+  }).catch(() => {});
+}
+
 function synthesizeKbQuery(node, outs = [], ins = []) {
   if (!node) return "";
   if (node.kind === "table") {
     const bits = ["database schema design", node.missing_primary_key ? "missing primary key" : null,
       node.high_risk_columns?.length ? "sensitive data columns" : null,
-      node.unenforced_relationships?.length ? "unenforced foreign key relationships" : null];
+      node.unenforced_relationships?.length ? "unenforced foreign key relationships" : null,
+      // ties chain_complexity (flow_risk_analyzer.chain_complexity, attached
+      // server-side during analysis) into KB retrieval — a table with an
+      // unusually deep request chain back to the frontend matches the same
+      // chatty-call-chain guidance already written for backend services.
+      node.chain_complexity?.high_complexity ? "chatty synchronous call chains request latency microservices" : null];
     return bits.filter(Boolean).join(" ");
   }
   // Translate the same design-smell signals already used for badges into terms
-  // that actually match the bundled SOLID/design-pattern/microservices reference
-  // docs, so "Get recommendations" retrieves real grounding for exactly the kind
-  // of critique its system prompt already asks for, not just team-uploaded docs.
+  // that actually match the bundled SOLID/design-pattern/microservices/API/
+  // integration/frontend reference docs, so "Get recommendations" retrieves
+  // real grounding for exactly the kind of critique its system prompt already
+  // asks for, not just team-uploaded docs.
+  const isTs = /\.[jt]sx?$/.test(node.id || node.file || "");
   const bits = [
     (node.security_issues || []).map((i) => i.test_id).join(" "),
     (node.god_file || (node.public_function_count ?? 0) > 15) ? "single responsibility principle god object" : null,
     node.long_conditional_chain_count ? "open closed principle strategy pattern polymorphism" : null,
     node.duplicate_function_count ? "DRY duplicated code reusability" : null,
-    node.static_utility_class_count ? "static utility class anti-pattern" : null,
-    node.many_boolean_props_count ? "control inversion boolean flag anti-pattern" : null,
+    node.static_utility_class_count ? "static utility class anti-pattern tree-shakable" : null,
+    node.many_boolean_props_count ? (isTs ? "compound components control inversion boolean prop sprawl" : "control inversion boolean flag anti-pattern") : null,
     ((outs?.length ?? 0) + (ins?.length ?? 0) > 12) ? "microservices coupling bounded context service boundaries" : null,
+    // flow_risk_analyzer.detect_concurrency_risks findings, attached
+    // server-side during analysis — retrieve the matching idempotency/
+    // integration guidance instead of only generic SOLID/pattern material.
+    (node.flow_risks || []).some((r) => r.risk_type === "non_idempotent_retry") ? "idempotency key retry safety idempotent consumer" : null,
+    (node.flow_risks || []).some((r) => r.risk_type === "unsynchronized_shared_state" || r.risk_type === "unsynchronized_background_task") ? "shared mutable state race condition synchronization" : null,
+    (node.flow_risks || []).some((r) => r.risk_type === "missing_timeout") ? "resilience circuit breaker timeout" : null,
+    isTs ? [
+      node.any_usage_count ? "typescript strict mode any type unknown type safety" : null,
+      node.non_strict_typescript ? "typescript strict mode discriminated union branded type" : null,
+      (node.avg_complexity ?? 0) > 10 || node.long_function_count ? "container presentational custom hooks state colocation" : null,
+    ].filter(Boolean).join(" ") : null,
   ];
   return bits.filter(Boolean).join(" ") || node.file;
 }
@@ -589,7 +625,7 @@ function KnowledgeSourcesPanel({ sources, query }) {
               <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap", marginBottom: 3 }}>
                 <span style={{ fontSize: 12, fontWeight: 600, color: "#0F2540" }}>{s.filename}{s.page ? ` · p.${s.page}` : ""}</span>
                 {s.is_builtin && (
-                  <span title="Bundled with the app — SOLID / design patterns / microservices reference" style={{ fontSize: 9.5, fontWeight: 700, color: "#5B3FA8", background: "#F1ECFB", padding: "1px 6px", borderRadius: 99 }}>
+                  <span title="Bundled with the app — SOLID, GoF design patterns, microservices, API design, integration patterns, and frontend best practices" style={{ fontSize: 9.5, fontWeight: 700, color: "#5B3FA8", background: "#F1ECFB", padding: "1px 6px", borderRadius: 99 }}>
                     Industry reference
                   </span>
                 )}
@@ -715,6 +751,15 @@ function FullGraphTab({ nodesById, edges, data, focal, setFocal, filterKind, tie
   const [recVoted, setRecVoted] = useState({}); // { [nodeId]: "up" | "down" } — this session's own votes, for button highlighting
   const [recentRecDownvotes, setRecentRecDownvotes] = useState([]);
   const [blastRadius, setBlastRadius] = useState({ forId: null, loading: false, data: null, error: null, direction: "both" });
+  // getRecommendations/fetchBlastRadius are plain functions re-created every
+  // render, but the D3 draw effect below only re-runs when [nodes,
+  // scopedEdges, setFocal, tiered] change — referencing them directly inside
+  // that effect would close over whichever version existed the last time it
+  // ran, silently calling a stale one after any other state change. A ref
+  // updated on every render (cheap — just a reassignment, not an effect) and
+  // read from inside the D3 event handler sidesteps that without forcing a
+  // full graph redraw on every keystroke/state change elsewhere on the page.
+  const latestActionsRef = useRef(null);
 
   useEffect(() => {
     fetch("/api/feedback/recent?vote=down&scope=recommendation&limit=5").then((r) => r.json()).then((d) => setRecentRecDownvotes(d.items || [])).catch(() => {});
@@ -810,7 +855,7 @@ function FullGraphTab({ nodesById, edges, data, focal, setFocal, filterKind, tie
       const kbQuery = synthesizeKbQuery(node, outs, ins);
       const kbSources = await searchKnowledgeBase(kbQuery);
       const kbSection = kbSources.length
-        ? `\n\nReference material retrieved from the knowledge base — a mix of the team's own uploaded documents and this app's bundled industry-standard references on SOLID, design patterns, and microservices architecture (cite by its [KB-...] tag when you use it — don't invent a citation for anything not listed here):\n${kbSources.map((s) => `[KB-${s.chunk_id}] ${s.filename}${s.page ? ` (p.${s.page})` : ""}: ${s.text}`).join("\n\n")}`
+        ? `\n\nReference material retrieved from the knowledge base — a mix of the team's own uploaded documents and this app's bundled industry-standard references on SOLID principles, the full Gang-of-Four design pattern catalog, microservices architecture, API design, integration patterns, and frontend best practices (cite by its [KB-...] tag when you use it — don't invent a citation for anything not listed here):\n${kbSources.map((s) => `[KB-${s.chunk_id}] ${s.filename}${s.page ? ` (p.${s.page})` : ""}: ${s.text}`).join("\n\n")}`
         : "";
 
       // Same in-context conditioning loop as the Ask tab (ChatTab.recentDownvotes)
@@ -836,7 +881,7 @@ function FullGraphTab({ nodesById, edges, data, focal, setFocal, filterKind, tie
       }
       systemPrompt += "\n\n" + PER_ITEM_CONFIDENCE_INSTRUCTION;
       if (kbSources.length) {
-        systemPrompt += "\n\nSome reference material is included below the metrics, each tagged [KB-<id>] — a mix of the team's own uploaded documents and this app's bundled industry-standard references on SOLID principles, design patterns, and microservices architecture best practices.";
+        systemPrompt += "\n\nSome reference material is included below the metrics, each tagged [KB-<id>] — a mix of the team's own uploaded documents and this app's bundled industry-standard references on SOLID principles, the Gang-of-Four design pattern catalog, microservices architecture, API design, integration patterns, and frontend best practices.";
       }
       systemPrompt += feedbackNote;
 
@@ -862,6 +907,9 @@ function FullGraphTab({ nodesById, edges, data, focal, setFocal, filterKind, tie
       // actually grounded in the retrieved sources — showing them next to an
       // error message would look like citations for an answer that doesn't exist.
       setRecommendation({ forId: node.id, loading: false, text, error: !!json.error, sources: json.error ? [] : kbSources, kbQuery });
+      if (!json.error) {
+        logChatExchange({ runId: data.run_id, kind: "recommendation", nodeId: node.id, question: `Recommendations for ${node.id}`, answer: text, kbQuery, sources: kbSources });
+      }
     } catch (e) {
       setRecommendation({ forId: node.id, loading: false, text: "Couldn't reach the guidance model.", error: true, sources: [], kbQuery: "" });
     }
@@ -996,8 +1044,48 @@ function FullGraphTab({ nodesById, edges, data, focal, setFocal, filterKind, tie
       .attr("paint-order", "stroke").attr("stroke", "#F5F9FD").attr("stroke-width", 3)
       .text((d) => shortName(d.id));
 
+    // Small warning badge for nodes flow_risk_analyzer flagged: a file with
+    // a concurrency/edge-case finding, or a table whose request chain back
+    // to the frontend is unusually deep. Purely a "worth a second look"
+    // signal at a glance — the actual findings/hop count live in the focal
+    // side panel once a node is clicked.
+    const flagged = nodeSel.filter((d) => (d.flow_risks && d.flow_risks.length > 0) || d.chain_complexity?.high_complexity);
+    flagged.append("circle")
+      .attr("cx", (d) => nodeRadius(d) * 0.68).attr("cy", (d) => -nodeRadius(d) * 0.68)
+      .attr("r", 7.5).attr("fill", "#F59E0B").attr("stroke", "#FFFFFF").attr("stroke-width", 1.5);
+    flagged.append("text")
+      .attr("x", (d) => nodeRadius(d) * 0.68).attr("y", (d) => -nodeRadius(d) * 0.68 + 3.3)
+      .attr("text-anchor", "middle").attr("font-size", 10).attr("font-weight", 800)
+      .attr("fill", "#FFFFFF").style("pointer-events", "none").text("!");
+    flagged.append("title").text((d) => {
+      const parts = [];
+      if (d.flow_risks?.length) parts.push(`${d.flow_risks.length} concurrency/edge-case finding${d.flow_risks.length === 1 ? "" : "s"}`);
+      if (d.chain_complexity?.high_complexity) parts.push(`deep request chain (${d.chain_complexity.hops_to_frontend} hops to frontend)`);
+      return parts.join(" · ");
+    });
+
     nodeSel.on("click", (event, d) => { event.stopPropagation(); setFocal(d.id); });
     svg.on("click", () => setFocal(null));
+
+    // Double-click a node to skip the two extra manual button presses:
+    // focus it AND immediately kick off both "Get recommendations" and a
+    // both-directions blast radius, so the side panel opens already
+    // populated. outs/ins are recomputed here (not read from the render
+    // body's `outs`/`ins`, which are only ever for the currently-focal
+    // node) using scopedEdges/scopedNodesById, both already in this
+    // effect's own closure and safe — scopedEdges is a declared dependency
+    // below, and scopedNodesById is derived solely from `nodes`, also a
+    // dependency, so both are current whenever this effect body runs.
+    nodeSel.on("dblclick", (event, d) => {
+      event.stopPropagation();
+      const actions = latestActionsRef.current;
+      if (!actions) return;
+      const dOuts = scopedEdges.filter((e) => e.source === d.id).map((e) => scopedNodesById[e.target]).filter(Boolean);
+      const dIns = scopedEdges.filter((e) => e.target === d.id).map((e) => scopedNodesById[e.source]).filter(Boolean);
+      setFocal(d.id);
+      actions.getRecommendations(d, dOuts, dIns);
+      actions.fetchBlastRadius(d.id, "both");
+    });
 
     // Deliberately no per-node drag: it used to compete with canvas panning
     // for the same pointer gesture, and since nodes are large and densely
@@ -1076,6 +1164,7 @@ function FullGraphTab({ nodesById, edges, data, focal, setFocal, filterKind, tie
   const focalNode = focal ? scopedNodesById[focal] : null;
   const outs = focal ? scopedEdges.filter((e) => e.source === focal).map((e) => scopedNodesById[e.target]).filter(Boolean) : [];
   const ins = focal ? scopedEdges.filter((e) => e.target === focal).map((e) => scopedNodesById[e.source]).filter(Boolean) : [];
+  latestActionsRef.current = { getRecommendations, fetchBlastRadius };
   const allIds = Object.keys(scopedNodesById);
   const results = query.length > 1 ? allIds.filter((id) => id.toLowerCase().includes(query.toLowerCase())).slice(0, 8) : [];
 
@@ -1113,7 +1202,7 @@ function FullGraphTab({ nodesById, edges, data, focal, setFocal, filterKind, tie
           <Workflow size={15} style={{ flexShrink: 0, marginTop: 1, color: "#0369A1" }} />
           <div style={{ fontSize: 11.5, color: "#3A4E68", lineHeight: 1.55 }}>
             <strong style={{ color: "#0F2540" }}>How to read this: </strong>
-            nodes are placed along the request path your code actually follows — <strong>Frontend</strong> (user-facing / entry code) → <strong>Backend</strong> (business logic) → <strong>Database</strong> — so debt concentration is visible stage by stage, not just file by file. Bright, thicker edges cross a tier boundary — real inter-layer coupling; faint edges stay inside one tier and are dimmed on purpose so they don't drown out the flow. Start with whichever tier below carries the highest average debt, then click a node for its details or an AI-grounded fix.
+            nodes are placed along the request path your code actually follows — <strong>Frontend</strong> (user-facing / entry code) → <strong>Backend</strong> (business logic) → <strong>Database</strong> — so debt concentration is visible stage by stage, not just file by file. A run with no database connected shows only the tiers it actually analyzed. Bright, thicker edges cross a tier boundary — real inter-layer coupling; faint edges stay inside one tier and are dimmed on purpose so they don't drown out the flow. Start with whichever tier below carries the highest average debt, then click a node for its details, or double-click it to jump straight to its recommendations and blast radius.
           </div>
         </div>
       )}
@@ -1188,6 +1277,29 @@ function FullGraphTab({ nodesById, edges, data, focal, setFocal, filterKind, tie
             <div style={{ display: "inline-block", fontSize: 11, padding: "2px 7px", borderRadius: 99, background: debtColor(focalNode.debt_score ?? 0), color: textOnColor(debtColor(focalNode.debt_score ?? 0)), marginBottom: 10, fontWeight: 700 }}>
               debt {(focalNode.debt_score ?? 0).toFixed(2)}
             </div>
+            {focalNode.flow_risks?.length > 0 && (
+              <div style={{ marginBottom: 10, padding: "7px 9px", background: "#FFFBEB", border: "1px solid #FDE68A", borderRadius: 8 }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 5, fontSize: 11, fontWeight: 700, color: "#92400E", marginBottom: 5 }}>
+                  <AlertTriangle size={12} /> {focalNode.flow_risks.length} flow risk{focalNode.flow_risks.length === 1 ? "" : "s"}
+                </div>
+                {focalNode.flow_risks.slice(0, 4).map((r, i) => (
+                  <div key={i} style={{ fontSize: 10.5, color: "#78350F", marginBottom: 3, lineHeight: 1.4 }}>
+                    L{r.line}: {r.label}
+                  </div>
+                ))}
+                <div style={{ fontSize: 9.5, color: "#B45309", marginTop: 2 }}>A lead to check, not a certainty — a static pattern scan.</div>
+              </div>
+            )}
+            {focalNode.chain_complexity && (
+              <div style={{ marginBottom: 10, padding: "7px 9px", background: focalNode.chain_complexity.high_complexity ? "#FFFBEB" : "#F8FBFF", border: `1px solid ${focalNode.chain_complexity.high_complexity ? "#FDE68A" : "#E1EBF5"}`, borderRadius: 8 }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 5, fontSize: 11, fontWeight: 700, color: focalNode.chain_complexity.high_complexity ? "#92400E" : "#0F2540" }}>
+                  <Workflow size={12} />
+                  {focalNode.chain_complexity.hops_to_frontend == null
+                    ? "No frontend-reachable request chain found"
+                    : `${focalNode.chain_complexity.hops_to_frontend} hop${focalNode.chain_complexity.hops_to_frontend === 1 ? "" : "s"} to frontend${focalNode.chain_complexity.high_complexity ? " — deep chain" : ""}`}
+                </div>
+              </div>
+            )}
             <div style={{ fontSize: 11.5, color: "#5B7290", marginBottom: 4 }}>Depends on ({outs.length})</div>
             <div style={{ display: "flex", flexWrap: "wrap", gap: 4, marginBottom: 8 }}>
               {outs.slice(0, 6).map((f) => (
@@ -1333,6 +1445,24 @@ function ModuleCard({ mod, onGenerate, generating }) {
         </div>
       </div>
 
+      {hasNarrative && mod.narrative.priority_files?.length > 0 && (
+        <div style={{ marginTop: 10, padding: "9px 11px", background: "#FFFBEB", border: "1px solid #FDE68A", borderRadius: 9 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 5, fontSize: 11, fontWeight: 700, color: "#92400E", marginBottom: 6 }}>
+            <AlertTriangle size={12} /> Files needing immediate attention
+          </div>
+          {mod.narrative.priority_files.map((pf, i) => (
+            <div key={i} style={{ marginBottom: i < mod.narrative.priority_files.length - 1 ? 8 : 0, fontSize: 11.5 }}>
+              <div style={{ display: "flex", alignItems: "baseline", gap: 6 }}>
+                <span style={{ fontSize: 10, fontWeight: 700, color: "#B45309", flexShrink: 0 }}>{i + 1}.</span>
+                <span style={{ fontFamily: "'IBM Plex Mono', monospace", fontWeight: 700, color: "#0F2540", wordBreak: "break-all" }}>{pf.file}</span>
+              </div>
+              {pf.reason && <div style={{ color: "#78350F", marginLeft: 16, marginTop: 1 }}>{pf.reason}</div>}
+              {pf.recommendation && <div style={{ color: "#0369A1", marginLeft: 16, marginTop: 2, fontWeight: 600 }}>→ {pf.recommendation}</div>}
+            </div>
+          ))}
+        </div>
+      )}
+
       {mod.narrative_status === "error" && (
         <div style={{ marginTop: 10, fontSize: 11.5, color: "#9F1D1D", background: "#FDECEC", border: "1px solid #F5C6C6", borderRadius: 7, padding: "6px 9px" }}>
           Narrative generation failed: {mod.narrative_error}
@@ -1347,10 +1477,16 @@ function ModuleCard({ mod, onGenerate, generating }) {
       {hasNarrative && (
         <div style={{ marginTop: 10 }}>
           <button onClick={() => setExpanded((e) => !e)} style={{ background: "none", border: "none", padding: 0, cursor: "pointer", fontSize: 11.5, color: "#0369A1", fontWeight: 600, display: "flex", alignItems: "center", gap: 4 }}>
-            <Info size={12} /> {expanded ? "Hide details" : "Responsibilities, key files & concerns"}
+            <Info size={12} /> {expanded ? "Hide details" : "Responsibilities, key files, concerns & recommendations"}
           </button>
           {expanded && (
             <div style={{ marginTop: 8, fontSize: 12, color: "#3A4E68", lineHeight: 1.6 }}>
+              {mod.narrative.recommendations?.length > 0 && (
+                <div style={{ marginBottom: 8, padding: "8px 10px", background: "#F0F9FF", border: "1px solid #CDE9FB", borderRadius: 7 }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 5, fontWeight: 700, color: "#0369A1", fontSize: 11 }}><Sparkles size={11} /> Recommendations</div>
+                  <ol style={{ margin: "3px 0 0", paddingLeft: 18 }}>{mod.narrative.recommendations.map((r, i) => <li key={i} style={{ marginBottom: 3 }}>{r}</li>)}</ol>
+                </div>
+              )}
               {mod.narrative.responsibilities?.length > 0 && (
                 <div style={{ marginBottom: 8 }}>
                   <div style={{ fontWeight: 700, color: "#0F2540", fontSize: 11 }}>Responsibilities</div>
@@ -1450,6 +1586,248 @@ function ArchitectureTab() {
 }
 
 // ---------------------------------------------------------------------------
+// Reports tab — stored, itemized top-10 debt report (debt_report.py). The
+// same question a user could already ask the Ask tab ("top 10 debt items
+// and what to do about them"), made a first-class, persisted artifact.
+// Confidence here is never the model's own self-rating — it's computed
+// server-side from how much real evidence (findings, not just the debt
+// score) backs each item, so it can't be hallucinated. See
+// backend/debt_report.py for the full grounding/confidence logic.
+// ---------------------------------------------------------------------------
+function reportItemIcon(kind) { return kind === "table" ? Database : FileText; }
+
+function ReportItemCard({ item, goToDeps }) {
+  const [expanded, setExpanded] = useState(false);
+  const c = confidenceColor(item.confidence_label);
+  const Icon = reportItemIcon(item.kind);
+  const evidenceCount = item.evidence_signals?.length || 0;
+  return (
+    <div style={{ background: "#FFFFFF", border: "1px solid #E1EBF5", borderRadius: 12, padding: 14, marginBottom: 10 }}>
+      <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 10 }}>
+        <div style={{ display: "flex", alignItems: "flex-start", gap: 8, minWidth: 0, flex: 1 }}>
+          <span style={{ fontSize: 11, fontWeight: 700, color: "#93A7BF", flexShrink: 0, marginTop: 2 }}>#{item.rank}</span>
+          <Icon size={14} color="#93A7BF" style={{ flexShrink: 0, marginTop: 2 }} />
+          <button onClick={() => goToDeps?.(item.node_id)} title="View in dependency flow"
+            style={{ background: "none", border: "none", padding: 0, cursor: goToDeps ? "pointer" : "default", textAlign: "left", fontFamily: "'IBM Plex Mono', monospace", fontSize: 12.5, fontWeight: 700, color: "#0F2540", wordBreak: "break-all" }}>
+            {item.node_id}
+          </button>
+        </div>
+        <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 5, flexShrink: 0 }}>
+          <span style={{ fontSize: 12, fontWeight: 700, padding: "3px 9px", borderRadius: 99, background: debtColor(item.debt_score), color: textOnColor(debtColor(item.debt_score)) }}>
+            {(item.debt_score || 0).toFixed(2)}
+          </span>
+          <span title="Computed from how many real, specific findings back this item — never the model's own self-rating" style={{ fontSize: 9.5, fontWeight: 700, color: c.fg, background: c.bg, padding: "1px 7px", borderRadius: 99, whiteSpace: "nowrap" }}>
+            {item.confidence_label} confidence ({Math.round((item.confidence_score || 0) * 100)}%)
+          </span>
+        </div>
+      </div>
+
+      {item.issue_summary && <div style={{ fontSize: 12.5, color: "#3A4E68", marginTop: 8, lineHeight: 1.5 }}>{item.issue_summary}</div>}
+
+      {item.recommendations?.length > 0 && (
+        <div style={{ marginTop: 8, padding: "8px 10px", background: "#F0F9FF", border: "1px solid #CDE9FB", borderRadius: 7 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 5, fontWeight: 700, color: "#0369A1", fontSize: 11 }}><Sparkles size={11} /> Recommendations</div>
+          <ol style={{ margin: "3px 0 0", paddingLeft: 18 }}>
+            {item.recommendations.map((r, i) => <li key={i} style={{ marginBottom: 3, fontSize: 12, color: "#0F2540" }}>{r}</li>)}
+          </ol>
+        </div>
+      )}
+
+      <button onClick={() => setExpanded((e) => !e)} style={{ marginTop: 8, background: "none", border: "none", padding: 0, cursor: "pointer", fontSize: 11, color: "#5B7290", fontWeight: 600, display: "flex", alignItems: "center", gap: 4 }}>
+        <Info size={11} /> {expanded ? "Hide grounding" : `Grounding (${evidenceCount} finding${evidenceCount === 1 ? "" : "s"}${item.kb_refs?.length ? `, ${item.kb_refs.length} reference${item.kb_refs.length === 1 ? "" : "s"}` : ""})`}
+      </button>
+      {expanded && (
+        <div style={{ marginTop: 6, fontSize: 11.5, color: "#5B7290", lineHeight: 1.6 }}>
+          {evidenceCount > 0 ? (
+            <ul style={{ margin: 0, paddingLeft: 18 }}>{item.evidence_signals.map((s, i) => <li key={i}>{s}</li>)}</ul>
+          ) : (
+            <div style={{ fontStyle: "italic" }}>No specific finding beyond the debt score itself — that's why this item's confidence is Low.</div>
+          )}
+          {item.kb_refs?.length > 0 && <div style={{ marginTop: 4 }}>Cited reference material: {item.kb_refs.join(", ")}</div>}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ReportsTab({ goToDeps }) {
+  const [reports, setReports] = useState([]);
+  const [selectedId, setSelectedId] = useState(null);
+  const [detail, setDetail] = useState(null);
+  const [loadingList, setLoadingList] = useState(true);
+  const [generating, setGenerating] = useState(false);
+  const [error, setError] = useState(null);
+  const [retrying, setRetrying] = useState(false);
+  const pollRef = useRef(null);
+
+  async function loadList(selectLatest) {
+    try {
+      // no-store: this list is polled/re-fetched on every load and retry, and
+      // without it the browser can serve a stale (or, worse, a broken/
+      // truncated) cached response instead of ever asking the backend again —
+      // which is exactly what made the Retry button look like a no-op.
+      const res = await fetch("/api/reports", { cache: "no-store" });
+      const json = await res.json();
+      const list = json.reports || [];
+      setReports(list);
+      if (selectLatest && list.length > 0) setSelectedId(list[0].report_id);
+      setLoadingList(false);
+      setError(null); // a later successful load clears an earlier transient failure
+    } catch {
+      setLoadingList(false);
+      setError("Couldn't reach the server.");
+      return false;
+    }
+    return true;
+  }
+
+  // Wraps loadList with a visible "Retrying…" state so a click on the Retry
+  // link always shows *something* happened, whether the backend answers
+  // this time or fails again with the same message (which otherwise renders
+  // identically to the click doing nothing at all).
+  async function retryNow() {
+    setRetrying(true);
+    await loadList(true);
+    setRetrying(false);
+  }
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      const ok = await loadList(true);
+      // The single most common cause of this failing on first load: the page
+      // was opened (or reloaded) in the brief window right after the backend
+      // was restarted, before it finished binding its port. One silent
+      // retry a moment later smooths over exactly that race instead of
+      // leaving a stale, alarming error up for a backend that's actually
+      // fine by the time anyone reads the message.
+      if (!ok && !cancelled) {
+        await new Promise((r) => setTimeout(r, 1500));
+        if (!cancelled) loadList(true);
+      }
+    })();
+    return () => { cancelled = true; if (pollRef.current) clearInterval(pollRef.current); };
+  }, []);
+
+  async function loadDetail(id) {
+    try {
+      const res = await fetch(`/api/reports/${id}`, { cache: "no-store" });
+      if (!res.ok) { setDetail(null); return null; }
+      const json = await res.json();
+      setDetail(json);
+      return json;
+    } catch {
+      setDetail(null);
+      return null;
+    }
+  }
+
+  useEffect(() => { if (selectedId != null) loadDetail(selectedId); }, [selectedId]);
+
+  function pollUntilDone(id) {
+    if (pollRef.current) clearInterval(pollRef.current);
+    let ticks = 0;
+    pollRef.current = setInterval(async () => {
+      ticks += 1;
+      const json = await loadDetail(id);
+      if (json && json.status !== "running") {
+        clearInterval(pollRef.current); pollRef.current = null;
+        setGenerating(false);
+        loadList(false);
+      }
+      if (ticks > 40) { clearInterval(pollRef.current); pollRef.current = null; setGenerating(false); } // ~80s safety stop
+    }, 2000);
+  }
+
+  async function generate() {
+    setGenerating(true);
+    setError(null);
+    // Clear any previously-loaded report before starting a new attempt —
+    // otherwise a fresh failure (e.g. the server was mid-restart) renders
+    // its error banner stacked on top of a stale, unrelated report from
+    // before, which reads as one confusing, self-contradictory result.
+    setDetail(null);
+    try {
+      const res = await fetch("/api/reports/generate", {
+        method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ n: 10 }),
+      });
+      const json = await res.json();
+      if (!json.ok) { setGenerating(false); setError(json.error || "Couldn't generate a report."); return; }
+      setSelectedId(json.report_id);
+      pollUntilDone(json.report_id);
+    } catch {
+      setGenerating(false);
+      setError("Couldn't reach the server.");
+    }
+  }
+
+  if (loadingList) return <div style={{ fontSize: 13, color: "#93A7BF", padding: 30 }}>Loading reports…</div>;
+
+  return (
+    <div>
+      <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 10, marginBottom: 14, flexWrap: "wrap" }}>
+        <div style={{ display: "flex", alignItems: "flex-start", gap: 8, padding: "9px 12px", background: "#F8FBFF", border: "1px solid #E1EBF5", borderRadius: 10, flex: 1, minWidth: 260 }}>
+          <ClipboardList size={15} style={{ flexShrink: 0, marginTop: 1, color: "#0369A1" }} />
+          <div style={{ fontSize: 11.5, color: "#3A4E68", lineHeight: 1.55 }}>
+            The top 10 highest-debt items in the latest run, each with grounded recommendations and a confidence score computed from the real findings behind it — never the model's own self-rating. The same thing you could ask the Ask tab for, itemized and saved so past runs stay comparable.
+          </div>
+        </div>
+        <button onClick={generate} disabled={generating}
+          style={{ display: "flex", alignItems: "center", gap: 6, padding: "9px 14px", background: generating ? "#F3F8FD" : "#0EA5E9", color: generating ? "#93A7BF" : "white", border: "none", borderRadius: 8, fontSize: 12.5, fontWeight: 600, cursor: generating ? "default" : "pointer", flexShrink: 0, whiteSpace: "nowrap" }}>
+          {generating ? <Loader2 size={13} className="spin-dashboard" /> : <Sparkles size={13} />} {generating ? "Generating…" : "Generate report"}
+        </button>
+      </div>
+
+      {error && (
+        <div style={{ marginBottom: 12, fontSize: 12, color: "#9F1D1D", background: "#FDECEC", border: "1px solid #F5C6C6", borderRadius: 8, padding: "8px 12px", display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10 }}>
+          <span>{error}</span>
+          <button onClick={retryNow} disabled={retrying} style={{ background: "none", border: "none", padding: 0, cursor: retrying ? "default" : "pointer", fontSize: 12, color: "#9F1D1D", fontWeight: 700, textDecoration: retrying ? "none" : "underline", opacity: retrying ? 0.6 : 1, flexShrink: 0 }}>{retrying ? "Retrying…" : "Retry"}</button>
+        </div>
+      )}
+
+      {reports.length > 1 && (
+        <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 14, fontSize: 12 }}>
+          <span style={{ color: "#5B7290" }}>Report:</span>
+          <select value={selectedId ?? ""} onChange={(e) => setSelectedId(Number(e.target.value))}
+            style={{ fontSize: 12, padding: "5px 8px", borderRadius: 7, border: "1px solid #E1EBF5", color: "#0F2540" }}>
+            {reports.map((r, i) => (
+              <option key={r.report_id} value={r.report_id}>
+                {timeAgo(r.created_at)}{r.run_id != null ? ` · run ${r.run_id}` : ""} · {r.status}{i === 0 ? " (latest)" : ""}
+              </option>
+            ))}
+          </select>
+        </div>
+      )}
+
+      {reports.length === 0 && (
+        <div style={{ background: "#F3F8FD", border: "1px dashed #C7DBEE", borderRadius: 12, padding: 40, textAlign: "center", color: "#5B7290", fontSize: 13.5 }}>
+          No report yet. Click "Generate report" to rank the latest run's top 10 debt items with grounded recommendations.
+        </div>
+      )}
+
+      {detail && detail.status === "running" && (
+        <div style={{ fontSize: 12.5, color: "#93A7BF", display: "flex", alignItems: "center", gap: 6, padding: 30, justifyContent: "center" }}>
+          <Loader2 size={13} className="spin-dashboard" /> Generating…
+        </div>
+      )}
+      {detail && detail.status === "error" && (
+        <div style={{ fontSize: 12.5, color: "#9F1D1D", background: "#FDECEC", border: "1px solid #F5C6C6", borderRadius: 8, padding: "10px 14px" }}>
+          Report generation failed: {detail.error}
+        </div>
+      )}
+      {detail && detail.status === "done" && (
+        <div>
+          <div style={{ fontSize: 11, color: "#93A7BF", marginBottom: 10 }}>
+            Generated {timeAgo(detail.created_at)}{detail.run_id != null ? ` from run ${detail.run_id}` : ""} · {detail.provider}/{detail.model}
+          </div>
+          {detail.items.map((item) => <ReportItemCard key={item.node_id} item={item} goToDeps={goToDeps} />)}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Chat / guidance tab
 // ---------------------------------------------------------------------------
 const SAMPLE_QUESTIONS = [
@@ -1499,6 +1877,86 @@ Top files by debt score:
 ${topFiles.map((f) => `- ${f.file}${f.repo ? ` [repo: ${f.repo}]` : ""} | debt=${f.debt_score} (complexity=${f.score_breakdown?.complexity}, churn=${f.score_breakdown?.churn}, security=${f.score_breakdown?.security}, design=${f.score_breakdown?.design}) | avg_complexity=${f.avg_complexity} | churn=${f.churn} | security_issues=${f.security_issue_count}(${f.security_high_count} high) | duplicate_functions=${f.duplicate_function_count ?? 0} | long_conditional_chains=${f.long_conditional_chain_count ?? 0} | fan_in=${f.fan_in}`).join("\n")}
 ${topTables.length ? `\nTop DB tables by debt score:\n${topTables.map((t) => `- ${t.file}${t.db ? ` [db: ${t.db}]` : ""} | debt=${t.debt_score} (performance=${t.score_breakdown?.performance}, security=${t.score_breakdown?.security}, design=${t.score_breakdown?.design}) | rows=${t.row_estimate ?? "unknown"} | missing_indexed_fks=${t.missing_indexed_fks ?? "unknown"} | high_risk_columns=${(t.high_risk_columns||[]).join(",") || "none"} | missing_pk=${t.missing_primary_key} | fk_in=${t.fk_in}`).join("\n")}` : ""}
 `;
+}
+
+// buildContext() above only ever includes the top 12 files / top 8 tables by
+// debt score — a real cross-layer summary, but it can miss the exact item a
+// question is actually about (a file ranked #40, or a table with no debt
+// concerns at all but a question about its schema). findMentionedNodes scans
+// the user's question text for a file/table this analysis actually knows
+// about, so `send()` below can fetch its real source (same /api/file-source
+// endpoint the graph's "Get recommendations" already uses) and full metrics
+// and inject them just for this question — code-in-context grounding keyed
+// to what the user actually asked, on top of the always-present summary.
+function findMentionedNodes(text, data, maxMatches = 2) {
+  if (!text) return [];
+  const lower = text.toLowerCase();
+  const candidates = [...(data.files || []), ...(data.tables || [])];
+  const scored = [];
+  for (const n of candidates) {
+    const id = n.file || n.id;
+    if (!id) continue;
+    const base = shortName(id);
+    let score = 0;
+    if (lower.includes(id.toLowerCase())) score = 3;               // full path/id mentioned
+    else if (base.length > 3 && lower.includes(base.toLowerCase())) score = 2; // bare filename/table mentioned
+    else if (n.bare_name && n.bare_name.length > 3 && lower.includes(n.bare_name.toLowerCase())) score = 2;
+    if (score > 0) scored.push({ node: n, score });
+  }
+  scored.sort((a, b) => b.score - a.score || (b.node.debt_score ?? 0) - (a.node.debt_score ?? 0));
+  return scored.slice(0, maxMatches).map((s) => s.node);
+}
+
+function describeMentionedNode(node, edges) {
+  const isTable = node.kind === "table";
+  const id = node.file || node.id;
+  const outs = (edges || []).filter((e) => e.source === id).map((e) => e.target);
+  const ins = (edges || []).filter((e) => e.target === id).map((e) => e.source);
+  const lines = [`Item: ${id} (${isTable ? "database table" : "code file"})`, `Debt score: ${node.debt_score}`];
+  if (!isTable) {
+    lines.push(`Avg complexity: ${node.avg_complexity} | Max complexity: ${node.max_complexity} | Maintainability index: ${node.maintainability_index}`);
+    lines.push(`Churn (2yr commits): ${node.churn} | Long functions: ${node.long_function_count} | Max nesting depth: ${node.max_nesting_depth} | God file: ${node.god_file}`);
+    if (node.security_issue_count > 0) {
+      lines.push(`Security findings (${node.security_issue_count}, ${node.security_high_count} high):`);
+      (node.security_issues || []).forEach((iss) => lines.push(`  - [${iss.severity}] ${iss.test_id}: ${iss.text} (line ${iss.line})`));
+    }
+    if (node.flow_risks?.length) {
+      lines.push(`Flow/concurrency risks (${node.flow_risks.length}, static pattern scan — a lead to check, not a certainty):`);
+      node.flow_risks.forEach((r) => lines.push(`  - L${r.line}: ${r.label} — ${r.detail}`));
+    }
+  } else {
+    lines.push(`Rows: ${node.row_estimate ?? "unknown"} | Columns: ${node.column_count} | Missing indexed FKs: ${node.missing_indexed_fks ?? "unknown"}`);
+    if (node.high_risk_columns?.length) lines.push(`High-risk columns exposed: ${node.high_risk_columns.join(", ")}`);
+    if (node.missing_primary_key) lines.push("No primary key declared.");
+    if (node.unenforced_relationships?.length) lines.push(`Columns that look like foreign keys but aren't enforced: ${node.unenforced_relationships.join(", ")}`);
+    if (node.chain_complexity) {
+      lines.push(`Request-chain hops back to frontend: ${node.chain_complexity.hops_to_frontend ?? "not reachable from an analyzed frontend"}${node.chain_complexity.high_complexity ? " (unusually deep)" : ""}`);
+    }
+  }
+  lines.push(`Depends on: ${outs.join(", ") || "none"}`);
+  lines.push(`Depended on by: ${ins.join(", ") || "none"}`);
+  return lines.join("\n");
+}
+
+async function buildMentionedItemsSection(text, data) {
+  const nodes = findMentionedNodes(text, data);
+  if (!nodes.length) return "";
+  const parts = await Promise.all(nodes.map(async (n) => {
+    const detail = describeMentionedNode(n, data.edges);
+    if (n.kind === "table") return detail;
+    try {
+      const srcRes = await fetch(`/api/file-source?id=${encodeURIComponent(n.file || n.id)}`);
+      const srcJson = await srcRes.json();
+      if (srcJson.ok) {
+        return `${detail}\n\nFull source${srcJson.truncated ? " (truncated)" : ""}:\n\`\`\`\n${srcJson.source}\n\`\`\``;
+      }
+    } catch {
+      // no source available (e.g. re-analyzed elsewhere since) — the metrics detail above still grounds the answer
+    }
+    return detail;
+  }));
+  const hasSource = nodes.some((n) => n.kind !== "table");
+  return `\n\nYour question appears to reference specific item(s) this analysis knows about — real metrics${hasSource ? " and source code" : ""} fetched for grounding, beyond the top-debt summary above:\n\n${parts.join("\n\n---\n\n")}`;
 }
 
 
@@ -1618,6 +2076,13 @@ function ChatTab({ data }) {
         ? "\n\nReference material relevant to this question is included below, each tagged [KB-<id>]."
         : "";
 
+      // Query-aware grounding: if the question names a specific file/table
+      // this analysis knows about, fetch its real source and full metrics
+      // (not just whatever made the top-12/top-8 summary) so the answer can
+      // be specific to it, the same way "Get recommendations" already
+      // grounds itself in a focal node's real source.
+      const mentionedSection = await buildMentionedItemsSection(text, data);
+
       const res = await fetch(CHAT_API_URL, {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -1631,11 +2096,11 @@ function ChatTab({ data }) {
           // answer before any items were written, while both Claude and
           // Gemini accepted 16384 without complaint and completed cleanly.
           max_tokens: 16384,
-          system: `You are the guidance layer of an engineering-debt dashboard for an engineering team. Answer ONLY using the metrics data below — never invent numbers, files, or tables that aren't listed, and never fabricate a business-impact estimate (dollars, hours saved, risk %) that isn't derivable from the data. Reference specific paths/tables and their actual values, including which score component (complexity/churn/security/design, or performance/security/design for tables) is driving the concern.
+          system: `You are the guidance layer of an engineering-debt dashboard for an engineering team. Answer ONLY using the metrics data below — never invent numbers, files, or tables that aren't listed, and never fabricate a business-impact estimate (dollars, hours saved, risk %) that isn't derivable from the data. Reference specific paths/tables and their actual values, including which score component (complexity/churn/security/design, or performance/security/design for tables) is driving the concern. If the question names a specific file or table this analysis knows about, its real source code and/or full metrics (including any flow-risk or request-chain-complexity findings) are fetched fresh and included in a dedicated section below the summary — use those over the summary numbers for that item, since the summary only ever lists the top 12 files / top 8 tables by debt score and can omit the exact item asked about.
 
 Format every answer in markdown with clear sections appropriate to the question — typically a short summary line, then '## '-headed sections such as findings, root causes, and recommendations. Be thorough and specific rather than terse: this is a working reference the team will read carefully, not a one-line reply. Still avoid padding — every sentence should carry real information from the data.
 
-${PER_ITEM_CONFIDENCE_INSTRUCTION}${feedbackNote}${kbInstruction}\n\n${context}${kbSection}`,
+${PER_ITEM_CONFIDENCE_INSTRUCTION}${feedbackNote}${kbInstruction}\n\n${context}${mentionedSection}${kbSection}`,
           messages: [...messages, userMsg].map((m) => ({ role: m.role, content: m.content })),
         }),
       });
@@ -1646,6 +2111,9 @@ ${PER_ITEM_CONFIDENCE_INSTRUCTION}${feedbackNote}${kbInstruction}\n\n${context}$
       // actually grounded in the retrieved sources — showing them next to an
       // error message would look like citations for an answer that doesn't exist.
       setMessages((m) => [...m, { role: "assistant", content: textOut, question: text, matched: mentioned, id: Date.now(), error: !!json.error, sources: json.error ? [] : kbSources, kbQuery: text }]);
+      if (!json.error) {
+        logChatExchange({ runId: data.run_id, kind: "chat", question: text, answer: textOut, kbQuery: text, sources: kbSources });
+      }
     } catch (e) {
       setMessages((m) => [...m, { role: "assistant", content: "Couldn't reach the guidance model — check Admin settings for a valid API key.", error: true, id: Date.now(), sources: [] }]);
     }
@@ -1742,6 +2210,7 @@ export default function Dashboard({ data, onReanalyze, jobRunning, jobStep, jobE
     { id: "db", label: "DB heatmap", icon: Database },
     { id: "flow", label: "Dependency flow", icon: Workflow },
     { id: "arch", label: "Architecture", icon: Boxes },
+    { id: "reports", label: "Reports", icon: ClipboardList },
     { id: "chat", label: "Ask", icon: MessageCircle },
   ];
 
@@ -1842,6 +2311,7 @@ export default function Dashboard({ data, onReanalyze, jobRunning, jobStep, jobE
           )}
           {tab === "flow" && <FullGraphTab nodesById={nodesById} edges={data.edges} data={data} focal={focal} setFocal={setFocal} tiered emptyLabel="No dependency data yet." />}
           {tab === "arch" && <ArchitectureTab />}
+          {tab === "reports" && <ReportsTab goToDeps={goToDeps} />}
           {tab === "chat" && <ChatTab data={data} />}
         </main>
       </div>

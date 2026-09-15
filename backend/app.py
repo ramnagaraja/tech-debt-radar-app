@@ -34,7 +34,9 @@ from pydantic import BaseModel
 import code_analyzers
 import coupling_analyzer
 import db_analyzers
+import debt_report
 import external_context
+import flow_risk_analyzer
 import graph_queries
 import knowledge_base
 import llm_providers
@@ -82,6 +84,19 @@ def init_app_db():
         FOREIGN KEY(run_id) REFERENCES analysis_runs(run_id))""")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_node_debt_history_node ON node_debt_history(node_id)")
 
+    # --- every Ask-tab question and every "Get recommendations" call,
+    # logged unconditionally (not just the ones a user thumbs-up/down's, the
+    # way chat_feedback only captures voted turns) and tagged with the
+    # analysis_runs row current when it happened, so a team can pull up
+    # "what did we ask, and what were we told, on run 12 vs run 15" for a
+    # real before/after comparison as the codebase changes across runs. ---
+    cur.execute("""CREATE TABLE IF NOT EXISTS chat_exchanges (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, run_id INTEGER, kind TEXT,
+        node_id TEXT, question TEXT, answer TEXT, kb_query TEXT,
+        sources_json TEXT, created_at TEXT,
+        FOREIGN KEY(run_id) REFERENCES analysis_runs(run_id))""")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_chat_exchanges_run ON chat_exchanges(run_id)")
+
     # --- PR-history mining results, keyed loosely by file suffix so a PR's
     # file path ("backend/app.py") still matches our namespaced file id
     # ("myrepo/backend/app.py") without requiring an exact match. ---
@@ -94,6 +109,21 @@ def init_app_db():
     cur.execute("""CREATE TABLE IF NOT EXISTS module_narratives (
         module_id TEXT PRIMARY KEY, content_hash TEXT, summary_json TEXT,
         narrative_json TEXT, status TEXT, error TEXT, generated_at TEXT)""")
+
+    # --- Reports tab: a stored, itemized top-N debt report per run (see
+    # debt_report.py). Additive like module_narratives — a report is a
+    # snapshot in time, never overwritten, so past reports stay comparable
+    # to the latest one. ---
+    cur.execute("""CREATE TABLE IF NOT EXISTS debt_reports (
+        report_id INTEGER PRIMARY KEY AUTOINCREMENT, run_id INTEGER, item_count INTEGER,
+        status TEXT, error TEXT, provider TEXT, model TEXT, created_at TEXT, completed_at TEXT,
+        FOREIGN KEY(run_id) REFERENCES analysis_runs(run_id))""")
+    cur.execute("""CREATE TABLE IF NOT EXISTS debt_report_items (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, report_id INTEGER, rank INTEGER, node_id TEXT,
+        kind TEXT, debt_score REAL, issue_summary TEXT, recommendations_json TEXT,
+        confidence_label TEXT, confidence_score REAL, evidence_json TEXT, kb_refs_json TEXT,
+        FOREIGN KEY(report_id) REFERENCES debt_reports(report_id))""")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_debt_report_items_report ON debt_report_items(report_id)")
 
     # --- MCP-proposed annotations on a graph node. Nothing here ever changes
     # a debt score or the graph itself — annotate_node (the MCP server's one
@@ -227,7 +257,10 @@ def record_run_history(payload):
     node_debt_history — additive, never overwritten, so /api/trend can chart
     a node's (or the whole codebase's) debt score across every past run.
     Best-effort: a history-write failure should never fail the analysis that
-    already succeeded and is already on disk in METRICS_PATH."""
+    already succeeded and is already on disk in METRICS_PATH. Returns the new
+    run_id (or None on failure) so the caller can stamp it onto the payload —
+    that's what lets every chat/recommendation exchange be tagged with the
+    run it happened under, for cross-run comparison in chat_exchanges."""
     try:
         conn = sqlite3.connect(APP_DB_PATH)
         cur = conn.cursor()
@@ -245,8 +278,9 @@ def record_run_history(payload):
         cur.executemany("INSERT INTO node_debt_history (run_id, node_id, kind, debt_score) VALUES (?,?,?,?)", rows)
         conn.commit()
         conn.close()
+        return run_id
     except Exception:
-        pass  # trend history is a nice-to-have overlay, never a reason to mark a completed analysis as failed
+        return None  # trend history is a nice-to-have overlay, never a reason to mark a completed analysis as failed
 
 
 def run_analysis(req: AnalyzeRequest):
@@ -323,6 +357,20 @@ def run_analysis(req: AnalyzeRequest):
         all_nodes = files + tables
         all_edges = code_edges + db_edges + code_to_table_edges + coupling_edges
 
+        JOB["step"] = "scanning for concurrency/edge-case risks and request-chain complexity"
+        concurrency_risks = flow_risk_analyzer.detect_concurrency_risks(source_text)
+        for f in files:
+            risks = concurrency_risks.get(f["id"])
+            if risks:
+                f["flow_risks"] = risks
+        if tables:
+            nodes_by_id = {n["id"]: n for n in all_nodes}
+            chain_info = flow_risk_analyzer.chain_complexity(all_edges, nodes_by_id)
+            for t in tables:
+                info = chain_info.get(t["id"])
+                if info:
+                    t["chain_complexity"] = info
+
         JOB["step"] = "writing results"
         write_sqlite(files, tables, all_edges)
 
@@ -358,14 +406,21 @@ def run_analysis(req: AnalyzeRequest):
                 "avg_code_debt": round(sum(f["debt_score"] for f in files) / len(files), 4) if files else 0,
                 "avg_db_debt": round(sum(t["debt_score"] for t in tables) / len(tables), 4) if tables else 0,
                 "high_debt_count": sum(1 for n in all_nodes if n["debt_score"] >= 0.6),
+                "flow_risk_count": sum(len(f.get("flow_risks", [])) for f in files),
+                "high_chain_complexity_count": sum(1 for t in tables if t.get("chain_complexity", {}).get("high_complexity")),
             },
             "files": files,
             "tables": tables,
             "edges": all_edges,
         }
+        # Recorded before the metrics file is written (not after, as before)
+        # so run_id can be stamped onto the payload itself — the frontend
+        # reads it straight off /api/metrics and tags every chat/
+        # recommendation exchange it logs with the run that was live when it
+        # happened, with no separate lookup needed.
+        payload["run_id"] = record_run_history(payload)
         with open(METRICS_PATH, "w") as fh:
             json.dump(payload, fh)
-        record_run_history(payload)
         JOB.update(status="done", step="complete")
     except Exception as e:
         JOB.update(status="error", error=str(e))
@@ -611,6 +666,174 @@ def feedback_stats():
     down = conn.execute("SELECT COUNT(*) FROM chat_feedback WHERE vote='down'").fetchone()[0]
     conn.close()
     return {"up": up, "down": down}
+
+
+# --- Per-run chat/recommendation history, for cross-run comparison ---------
+# Distinct from chat_feedback above: this logs EVERY Ask-tab question and
+# EVERY "Get recommendations" call unconditionally (not just the ones a user
+# happens to thumbs-up/down), tagged with the run_id current when it
+# happened, so "what changed between what we were told on run 12 vs run 15"
+# is a real query instead of relying on someone's memory or chat scrollback.
+
+class ChatExchangeRequest(BaseModel):
+    run_id: int | None = None
+    kind: str                    # "chat" (Ask tab) | "recommendation" (a node's "Get recommendations")
+    node_id: str | None = None   # set for "recommendation", null for "chat"
+    question: str
+    answer: str
+    kb_query: str | None = None
+    sources: list[str] = []      # KB chunk ids cited in the answer, e.g. ["a1b2c3...", ...]
+
+
+@app.post("/api/chat-history")
+def log_chat_exchange(req: ChatExchangeRequest):
+    conn = sqlite3.connect(APP_DB_PATH)
+    conn.execute(
+        """INSERT INTO chat_exchanges (run_id, kind, node_id, question, answer, kb_query, sources_json, created_at)
+           VALUES (?,?,?,?,?,?,?,?)""",
+        (req.run_id, req.kind, req.node_id, req.question, req.answer, req.kb_query,
+         json.dumps(req.sources), datetime.now(timezone.utc).isoformat()),
+    )
+    conn.commit()
+    conn.close()
+    return {"ok": True}
+
+
+@app.get("/api/chat-history")
+def get_chat_history(run_id: int | None = None, kind: str | None = None, node_id: str | None = None, limit: int = 100):
+    clauses, params = [], []
+    if run_id is not None:
+        clauses.append("run_id = ?")
+        params.append(run_id)
+    if kind is not None:
+        clauses.append("kind = ?")
+        params.append(kind)
+    if node_id is not None:
+        clauses.append("node_id = ?")
+        params.append(node_id)
+    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    conn = sqlite3.connect(APP_DB_PATH)
+    rows = conn.execute(
+        f"""SELECT id, run_id, kind, node_id, question, answer, kb_query, sources_json, created_at
+            FROM chat_exchanges {where} ORDER BY id DESC LIMIT ?""",
+        (*params, limit),
+    ).fetchall()
+    conn.close()
+    items = [
+        {"id": r[0], "run_id": r[1], "kind": r[2], "node_id": r[3], "question": r[4], "answer": r[5],
+         "kb_query": r[6], "sources": json.loads(r[7]) if r[7] else [], "created_at": r[8]}
+        for r in rows
+    ]
+    return {"items": items}
+
+
+# --- Reports tab: stored, itemized top-N debt reports (see debt_report.py) -
+# Same async job + polling shape as module narrative generation above: the
+# LLM call can take several seconds, so /api/reports/generate returns
+# immediately with a report_id in "running" status and the frontend polls
+# GET /api/reports/{id} until status is "done" or "error".
+
+def _generate_report_job(report_id, items, provider, model, api_key, base_url):
+    result = debt_report.generate_report(items, provider, model, api_key, base_url=base_url)
+    conn = sqlite3.connect(APP_DB_PATH)
+    now = datetime.now(timezone.utc).isoformat()
+    if result.get("ok"):
+        for it in result["items"]:
+            conn.execute(
+                """INSERT INTO debt_report_items
+                   (report_id, rank, node_id, kind, debt_score, issue_summary, recommendations_json,
+                    confidence_label, confidence_score, evidence_json, kb_refs_json)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                (report_id, it["rank"], it["node_id"], it["kind"], it["debt_score"], it["issue_summary"],
+                 json.dumps(it["recommendations"]), it["confidence_label"], it["confidence_score"],
+                 json.dumps(it["evidence_signals"]), json.dumps(it["kb_refs"])),
+            )
+        conn.execute("UPDATE debt_reports SET status='done', completed_at=? WHERE report_id=?", (now, report_id))
+    else:
+        conn.execute("UPDATE debt_reports SET status='error', error=?, completed_at=? WHERE report_id=?", (result.get("error"), now, report_id))
+    conn.commit()
+    conn.close()
+
+
+class GenerateReportRequest(BaseModel):
+    n: int = debt_report.TOP_N_DEFAULT
+
+
+@app.post("/api/reports/generate")
+def generate_report_endpoint(req: GenerateReportRequest):
+    data = _load_current_metrics()
+    if not data:
+        return {"ok": False, "error": "No analysis has been run yet."}
+    items = debt_report.top_n_items(data.get("files", []), data.get("tables", []), max(1, min(req.n, 25)))
+    if not items:
+        return {"ok": False, "error": "No analyzed files or tables to report on yet."}
+
+    provider = get_setting("active_provider", "anthropic")
+    model = get_setting(f"{provider}_model", llm_providers.PROVIDERS[provider]["default_model"])
+    api_key = get_setting(f"{provider}_api_key")
+    if not api_key and provider == "anthropic":
+        api_key = os.environ.get("ANTHROPIC_API_KEY") or HARDCODED_ANTHROPIC_API_KEY
+    base_url = get_setting("ollama_base_url", llm_providers.DEFAULT_OLLAMA_BASE_URL) if provider == "ollama" else None
+
+    conn = sqlite3.connect(APP_DB_PATH)
+    now = datetime.now(timezone.utc).isoformat()
+    cur = conn.execute(
+        "INSERT INTO debt_reports (run_id, item_count, status, error, provider, model, created_at, completed_at) VALUES (?,?,?,?,?,?,?,?)",
+        (data.get("run_id"), len(items), "running", None, provider, model, now, None),
+    )
+    report_id = cur.lastrowid
+    conn.commit()
+    conn.close()
+
+    t = threading.Thread(target=_generate_report_job, args=(report_id, items, provider, model, api_key, base_url), daemon=True)
+    t.start()
+    return {"ok": True, "report_id": report_id}
+
+
+@app.get("/api/reports")
+def list_reports(limit: int = 20):
+    conn = sqlite3.connect(APP_DB_PATH)
+    rows = conn.execute(
+        """SELECT report_id, run_id, item_count, status, error, provider, model, created_at, completed_at
+           FROM debt_reports ORDER BY report_id DESC LIMIT ?""",
+        (limit,),
+    ).fetchall()
+    conn.close()
+    return {"reports": [
+        {"report_id": r[0], "run_id": r[1], "item_count": r[2], "status": r[3], "error": r[4],
+         "provider": r[5], "model": r[6], "created_at": r[7], "completed_at": r[8]}
+        for r in rows
+    ]}
+
+
+@app.get("/api/reports/{report_id}")
+def get_report(report_id: int):
+    conn = sqlite3.connect(APP_DB_PATH)
+    header = conn.execute(
+        """SELECT report_id, run_id, item_count, status, error, provider, model, created_at, completed_at
+           FROM debt_reports WHERE report_id=?""",
+        (report_id,),
+    ).fetchone()
+    if not header:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Report not found.")
+    rows = conn.execute(
+        """SELECT rank, node_id, kind, debt_score, issue_summary, recommendations_json,
+                  confidence_label, confidence_score, evidence_json, kb_refs_json
+           FROM debt_report_items WHERE report_id=? ORDER BY rank""",
+        (report_id,),
+    ).fetchall()
+    conn.close()
+    items = [{
+        "rank": r[0], "node_id": r[1], "kind": r[2], "debt_score": r[3], "issue_summary": r[4],
+        "recommendations": json.loads(r[5] or "[]"), "confidence_label": r[6], "confidence_score": r[7],
+        "evidence_signals": json.loads(r[8] or "[]"), "kb_refs": json.loads(r[9] or "[]"),
+    } for r in rows]
+    return {
+        "report_id": header[0], "run_id": header[1], "item_count": header[2], "status": header[3],
+        "error": header[4], "provider": header[5], "model": header[6], "created_at": header[7],
+        "completed_at": header[8], "items": items,
+    }
 
 
 def _load_current_metrics():

@@ -53,8 +53,17 @@ def extract_json(text, expect="object"):
     raise ValueError(f"No JSON {kind} found in the model's response.")
 
 
-def call_llm(provider, model, api_key, system, messages, max_tokens=1000, base_url=None):
-    """messages: [{"role": "user"|"assistant", "content": str}, ...]. Returns plain text."""
+def call_llm(provider, model, api_key, system, messages, max_tokens=1000, base_url=None, json_mode=False):
+    """messages: [{"role": "user"|"assistant", "content": str}, ...]. Returns plain text.
+
+    json_mode: when True (only meaningful for the OpenAI-compatible providers
+    below — Gemini and Ollama), asks the API itself to constrain its output
+    to valid JSON via response_format, rather than relying on prompt wording
+    alone. Some OpenAI-compatible deployments reject the parameter outright;
+    if so, this transparently retries the same call without it instead of
+    losing the whole request over an unsupported option. Anthropic has no
+    equivalent API-level switch, so this is a no-op there — Claude follows a
+    strict-JSON system prompt reliably enough on its own."""
     if not api_key and provider != "ollama":
         raise ValueError(f"No API key configured for provider '{provider}'. Set it in Admin settings.")
 
@@ -63,31 +72,39 @@ def call_llm(provider, model, api_key, system, messages, max_tokens=1000, base_u
         client = anthropic.Anthropic(api_key=api_key)
         resp = client.messages.create(model=model, max_tokens=max_tokens, system=system, messages=messages)
         text = "".join(b.text for b in resp.content if getattr(b, "type", None) == "text")
-        if not text and resp.stop_reason == "max_tokens":
+        if resp.stop_reason == "max_tokens":
             # The model can spend part of its token budget on internal
-            # reasoning before writing any visible text; if that reasoning
-            # alone exhausts max_tokens, resp.content has no text block at
-            # all. Surfacing this explicitly beats returning "" and letting
-            # the caller silently render "No response." with no indication
-            # anything went wrong.
+            # reasoning before writing any visible text (or exhaust it
+            # partway through writing the answer); either way, whatever text
+            # made it through is truncated and not safe to treat as a
+            # complete answer. Surfacing this explicitly beats letting the
+            # caller try to parse/render a silently truncated response.
             raise RuntimeError(
-                f"The model ran out of its {max_tokens}-token response budget before writing any answer "
-                "(it spent it on internal reasoning). Try a narrower question, or ask again."
+                f"The model ran out of its {max_tokens}-token response budget"
+                + (" before writing any answer (it spent it on internal reasoning)" if not text else " partway through its answer")
+                + ". Try a narrower question, a smaller batch, or ask again."
             )
         return text
 
     if provider == "gemini":
         from openai import OpenAI
         client = OpenAI(api_key=api_key, base_url="https://generativelanguage.googleapis.com/v1beta/openai/")
-        resp = client.chat.completions.create(
-            model=model, max_tokens=max_tokens,
-            messages=[{"role": "system", "content": system}] + messages,
-        )
+        kwargs = dict(model=model, max_tokens=max_tokens, messages=[{"role": "system", "content": system}] + messages)
+        if json_mode:
+            kwargs["response_format"] = {"type": "json_object"}
+        try:
+            resp = client.chat.completions.create(**kwargs)
+        except Exception:
+            if not json_mode:
+                raise
+            kwargs.pop("response_format", None)
+            resp = client.chat.completions.create(**kwargs)
         text = resp.choices[0].message.content or ""
-        if not text and resp.choices[0].finish_reason == "length":
+        if resp.choices[0].finish_reason == "length":
             raise RuntimeError(
-                f"The model ran out of its {max_tokens}-token response budget before writing any answer. "
-                "Try a narrower question, or ask again."
+                f"The model ran out of its {max_tokens}-token response budget"
+                + (" before writing any answer" if not text else " partway through its answer")
+                + ". Try a narrower question, a smaller batch, or ask again."
             )
         return text
 
@@ -96,21 +113,32 @@ def call_llm(provider, model, api_key, system, messages, max_tokens=1000, base_u
         # Ollama's OpenAI-compatible endpoint ignores the API key entirely,
         # but the openai SDK requires some non-empty string to construct a client.
         client = OpenAI(api_key=api_key or "ollama", base_url=base_url or DEFAULT_OLLAMA_BASE_URL)
+        kwargs = dict(model=model, max_tokens=max_tokens, messages=[{"role": "system", "content": system}] + messages)
+        if json_mode:
+            kwargs["response_format"] = {"type": "json_object"}
         try:
-            resp = client.chat.completions.create(
-                model=model, max_tokens=max_tokens,
-                messages=[{"role": "system", "content": system}] + messages,
-            )
+            resp = client.chat.completions.create(**kwargs)
         except Exception as e:
-            raise RuntimeError(
-                f"Couldn't reach the local Ollama server at {base_url or DEFAULT_OLLAMA_BASE_URL} "
-                f"(is 'ollama serve' running, and is '{model}' pulled?): {e}"
-            )
+            if json_mode:
+                try:
+                    kwargs.pop("response_format", None)
+                    resp = client.chat.completions.create(**kwargs)
+                except Exception as e2:
+                    raise RuntimeError(
+                        f"Couldn't reach the local Ollama server at {base_url or DEFAULT_OLLAMA_BASE_URL} "
+                        f"(is 'ollama serve' running, and is '{model}' pulled?): {e2}"
+                    )
+            else:
+                raise RuntimeError(
+                    f"Couldn't reach the local Ollama server at {base_url or DEFAULT_OLLAMA_BASE_URL} "
+                    f"(is 'ollama serve' running, and is '{model}' pulled?): {e}"
+                )
         text = resp.choices[0].message.content or ""
-        if not text and resp.choices[0].finish_reason == "length":
+        if resp.choices[0].finish_reason == "length":
             raise RuntimeError(
-                f"The model ran out of its {max_tokens}-token response budget before writing any answer. "
-                "Try a narrower question, or ask again."
+                f"The model ran out of its {max_tokens}-token response budget"
+                + (" before writing any answer" if not text else " partway through its answer")
+                + ". Try a narrower question, a smaller batch, or ask again."
             )
         return text
 

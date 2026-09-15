@@ -20,6 +20,7 @@ the ML sense: no model weights are updated anywhere, only a per-chunk
 trust multiplier computed from a vote history. Same honest distinction the
 existing chat thumbs-up/down loop documents in README.md.
 """
+import hashlib
 import os
 import sqlite3
 import uuid
@@ -63,6 +64,11 @@ def _init_tables():
         conn.commit()
     except sqlite3.OperationalError:
         pass  # column already exists — a DB created before this field was added
+    try:
+        conn.execute("ALTER TABLE kb_documents ADD COLUMN content_hash TEXT")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass  # column already exists — a DB created before this field was added
     conn.execute("""CREATE TABLE IF NOT EXISTS kb_chunks (
         id TEXT PRIMARY KEY, doc_id TEXT, chunk_index INTEGER,
         page INTEGER, text TEXT, embedding BLOB)""")
@@ -81,7 +87,10 @@ SEED_DIR = BACKEND_DIR / "knowledge_seed"
 # retrieve and cite even before a team uploads anything of their own. Ingested
 # through the exact same pipeline as a manual upload — the only difference is
 # the is_builtin flag, which just protects them from accidental deletion.
-BUILTIN_SEED_FILES = ["solid_principles.md", "design_patterns.md", "microservices_architecture.md"]
+BUILTIN_SEED_FILES = [
+    "solid_principles.md", "design_patterns.md", "microservices_architecture.md",
+    "api_best_practices.md", "integration_patterns.md", "frontend_best_practices.md",
+]
 
 
 def _get_model():
@@ -216,22 +225,51 @@ def ingest_document(path, filename):
     return doc_id
 
 
+def _seed_content_hash(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
 def ensure_builtin_seed_documents():
-    """Ingests the bundled reference docs on first run. Idempotent — checks
-    for an existing is_builtin row per filename before re-ingesting, so this
-    is safe to call on every startup."""
+    """Ingests the bundled reference docs on first run, and re-ingests any
+    seed file whose content has changed since it was last ingested (e.g. the
+    design-patterns doc expanded to the full GoF catalog, or a new best-
+    practices doc added to BUILTIN_SEED_FILES) — otherwise a doc that was
+    already ingested on a prior run would sit stale forever, since the app's
+    seed markdown files ship inside the app itself, not through the same
+    upload flow that would naturally create a new document row. Safe to call
+    on every startup: a filename whose stored content_hash still matches the
+    seed file on disk is left untouched (existing chunk IDs, embeddings, and
+    any accumulated feedback trust multipliers survive)."""
     conn = _connect()
-    existing = {row[0] for row in conn.execute("SELECT filename FROM kb_documents WHERE is_builtin = 1").fetchall()}
+    existing = {
+        row[0]: (row[1], row[2])  # filename -> (doc_id, content_hash)
+        for row in conn.execute("SELECT filename, id, content_hash FROM kb_documents WHERE is_builtin = 1").fetchall()
+    }
     conn.close()
     for filename in BUILTIN_SEED_FILES:
-        if filename in existing:
-            continue
         path = SEED_DIR / filename
         if not path.exists():
             continue
+        current_hash = _seed_content_hash(path)
+        prior = existing.get(filename)
+        if prior is not None:
+            prior_doc_id, prior_hash = prior
+            if prior_hash == current_hash:
+                continue  # unchanged since last ingest — nothing to do
+            # Seed file changed on disk since this builtin doc was ingested:
+            # replace it. Goes around delete_document()'s is_builtin guard
+            # (that guard is for the admin-facing delete endpoint, protecting
+            # against an accidental click — this is the app's own seed
+            # content being refreshed, not a user deleting a reference doc).
+            conn = _connect()
+            conn.execute("DELETE FROM kb_feedback_events WHERE chunk_id IN (SELECT id FROM kb_chunks WHERE doc_id = ?)", (prior_doc_id,))
+            conn.execute("DELETE FROM kb_chunks WHERE doc_id = ?", (prior_doc_id,))
+            conn.execute("DELETE FROM kb_documents WHERE id = ?", (prior_doc_id,))
+            conn.commit()
+            conn.close()
         doc_id = ingest_document(str(path), filename)
         conn = _connect()
-        conn.execute("UPDATE kb_documents SET is_builtin = 1 WHERE id = ?", (doc_id,))
+        conn.execute("UPDATE kb_documents SET is_builtin = 1, content_hash = ? WHERE id = ?", (current_hash, doc_id))
         conn.commit()
         conn.close()
 
